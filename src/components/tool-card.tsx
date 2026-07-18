@@ -2,6 +2,7 @@ import * as m from "motion/react-m";
 import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 
 import { StructuredData } from "@/components/structured-data";
+import { toolLineChanges } from "@/lib/tool-line-changes";
 import type { ToolItem } from "@/lib/types";
 
 const MarkdownBody = lazy(() =>
@@ -38,6 +39,7 @@ function summary(tool: ToolItem): string {
 export function ToolCard({ tool }: { tool: ToolItem }) {
   const [expanded, setExpanded] = useState(tool.status !== "success");
   const detail = useMemo(() => summary(tool), [tool]);
+  const lineChanges = useMemo(() => toolLineChanges(tool), [tool]);
 
   useEffect(() => {
     if (tool.status === "error") setExpanded(true);
@@ -61,6 +63,19 @@ export function ToolCard({ tool }: { tool: ToolItem }) {
         </span>
         <strong>{tool.name}</strong>
         <span className="tool-summary">{detail}</span>
+        {lineChanges && (
+          <span
+            className="tool-line-changes"
+            title={`${lineChanges.added} added, ${lineChanges.removed} removed`}
+          >
+            {lineChanges.added > 0 && (
+              <span className="tool-lines-added">+{lineChanges.added}</span>
+            )}
+            {lineChanges.removed > 0 && (
+              <span className="tool-lines-removed">-{lineChanges.removed}</span>
+            )}
+          </span>
+        )}
         <span className="tool-state">
           {tool.status === "running" ? "running" : tool.status === "success" ? "done" : "error"}
         </span>

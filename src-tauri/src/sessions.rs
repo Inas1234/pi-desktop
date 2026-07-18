@@ -296,11 +296,26 @@ fn project_transcript_entry(value: &Value) -> Option<Value> {
 }
 
 pub fn project_session_dir(project: &ProjectRecord) -> PathBuf {
-    let base = configured_session_root(project).unwrap_or_else(|| pi_agent_dir().join("sessions"));
-    base.join(encode_project_path(&project.path))
+    resolve_project_session_dir(
+        configured_session_dir(project),
+        pi_agent_dir(),
+        &project.path,
+    )
 }
 
-fn configured_session_root(project: &ProjectRecord) -> Option<PathBuf> {
+fn resolve_project_session_dir(
+    configured: Option<PathBuf>,
+    agent_dir: PathBuf,
+    project_path: &Path,
+) -> PathBuf {
+    configured.unwrap_or_else(|| {
+        agent_dir
+            .join("sessions")
+            .join(encode_project_path(project_path))
+    })
+}
+
+fn configured_session_dir(project: &ProjectRecord) -> Option<PathBuf> {
     if let Some(value) = std::env::var_os("PI_CODING_AGENT_SESSION_DIR") {
         return Some(expand_home(PathBuf::from(value)));
     }
@@ -341,8 +356,18 @@ fn expand_home(path: PathBuf) -> PathBuf {
 }
 
 fn encode_project_path(path: &Path) -> String {
-    let encoded = path
-        .to_string_lossy()
+    let raw = path.to_string_lossy();
+    let resolved = if let Some(path) = raw.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{path}")
+    } else if let Some(path) = raw.strip_prefix(r"\\?\") {
+        path.to_owned()
+    } else {
+        raw.into_owned()
+    };
+    let resolved = resolved
+        .strip_prefix(['/', '\\'])
+        .unwrap_or(resolved.as_str());
+    let encoded = resolved
         .chars()
         .map(|character| match character {
             ':' | '/' | '\\' => '-',
@@ -474,11 +499,36 @@ fn same_path(left: &Path, right: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
+    use std::{io::Write, path::Path};
 
     use tempfile::NamedTempFile;
 
-    use super::{load_message_page, read_summary};
+    use super::{
+        encode_project_path, load_message_page, read_summary, resolve_project_session_dir,
+    };
+
+    #[test]
+    fn matches_pi_project_path_encoding_for_windows_verbatim_paths() {
+        assert_eq!(
+            encode_project_path(Path::new(r"\\?\D:\Programing\Web\pi-desktop")),
+            "--D--Programing-Web-pi-desktop--"
+        );
+        assert_eq!(
+            encode_project_path(Path::new("/home/pi/project")),
+            "--home-pi-project--"
+        );
+    }
+
+    #[test]
+    fn uses_configured_session_directory_without_project_nesting() {
+        let configured = Path::new("custom-sessions").to_path_buf();
+        let resolved = resolve_project_session_dir(
+            Some(configured.clone()),
+            Path::new("agent").to_path_buf(),
+            Path::new("project"),
+        );
+        assert_eq!(resolved, configured);
+    }
 
     #[test]
     fn reads_tolerant_session_metadata() {

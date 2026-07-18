@@ -235,7 +235,7 @@ describe("Pi event reducer", () => {
         id: "widget",
         method: "setWidget",
         widgetKey: "agents",
-        widgetLines: ["one", "two"],
+        widgetLines: ["\u001b[32mone\u001b[0m", "two"],
         widgetPlacement: "belowEditor",
       },
       {
@@ -243,9 +243,14 @@ describe("Pi event reducer", () => {
         id: "status",
         method: "setStatus",
         statusKey: "agents",
-        statusText: "running",
+        statusText: "\u001b[38;2;102;102;102mrunning\u001b[0m",
       },
-      { type: "extension_ui_request", id: "title", method: "setTitle", title: "Agent team" },
+      {
+        type: "extension_ui_request",
+        id: "title",
+        method: "setTitle",
+        title: "\u001b]0;ignored\u0007Agent team",
+      },
       ...Array.from({ length: 12 }, (_, index) => ({
         type: "extension_ui_request",
         id: `notice-${index}`,

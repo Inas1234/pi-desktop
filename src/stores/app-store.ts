@@ -18,7 +18,7 @@ import type {
   ToolItem,
   TranscriptItem,
 } from "@/lib/types";
-import { errorMessage } from "@/lib/utils";
+import { errorMessage, stripTerminalFormatting } from "@/lib/utils";
 
 const defaultSettings: AppSettings = {
   theme: "system",
@@ -40,6 +40,8 @@ export function createRuntime(): ProjectRuntime {
     stats: {},
     sessions: [],
     sessionsLoading: false,
+    sessionsLoaded: false,
+    sessionsError: null,
     historyCursor: null,
     hasOlder: false,
     historyLoading: false,
@@ -535,7 +537,7 @@ function applyPiEvent(
           ...runtime.notifications,
           {
             id: request.id,
-            message: String(request.message ?? ""),
+            message: stripTerminalFormatting(String(request.message ?? "")),
             tone,
           },
         ].slice(-10),
@@ -543,22 +545,18 @@ function applyPiEvent(
     }
     if (request.method === "setStatus") {
       const key = String(request.statusKey ?? "extension");
-      const text = request.statusText;
+      const text =
+        typeof request.statusText === "string" ? stripTerminalFormatting(request.statusText) : null;
       return {
         ...runtime,
-        status: boundedRecord(
-          runtime.status,
-          key,
-          typeof text === "string" && text ? text : null,
-          32,
-        ),
+        status: boundedRecord(runtime.status, key, text || null, 32),
       };
     }
     if (request.method === "setWidget") {
       const key = String(request.widgetKey ?? "extension");
       const widget = Array.isArray(request.widgetLines)
         ? {
-            lines: request.widgetLines.map(String),
+            lines: request.widgetLines.map((line) => stripTerminalFormatting(String(line))),
             placement:
               request.widgetPlacement === "belowEditor"
                 ? ("belowEditor" as const)
@@ -570,11 +568,17 @@ function applyPiEvent(
     if (request.method === "setTitle") {
       return {
         ...runtime,
-        extensionTitle: typeof request.title === "string" && request.title ? request.title : null,
+        extensionTitle:
+          typeof request.title === "string" && request.title
+            ? stripTerminalFormatting(request.title)
+            : null,
       };
     }
     if (request.method === "set_editor_text") {
-      return { ...runtime, composerText: String(request.text ?? "") };
+      return {
+        ...runtime,
+        composerText: stripTerminalFormatting(String(request.text ?? "")),
+      };
     }
     if (runtime.extensionRequests.some((entry) => entry.id === request.id)) return runtime;
     return { ...runtime, extensionRequests: [...runtime.extensionRequests, request].slice(-16) };
@@ -691,6 +695,11 @@ function flushEvents() {
 function enqueueEvent(event: AppEvent) {
   eventQueue.push(event);
   if (frame == null) frame = requestAnimationFrame(flushEvents);
+  const piEvents =
+    event.type === "pi_event" ? [event.event] : event.type === "pi_events" ? event.events : [];
+  if (piEvents.some((entry) => entry.type === "agent_settled")) {
+    void refreshSessions(event.projectId);
+  }
 }
 
 function applyTheme(settings: AppSettings) {
@@ -712,16 +721,36 @@ async function withError<T>(operation: () => Promise<T>): Promise<T | undefined>
 }
 
 async function refreshSessions(projectId: string, query = "") {
-  publish(updateRuntime(state, projectId, (runtime) => ({ ...runtime, sessionsLoading: true })));
-  const sessions = await withError(() => desktop.listSessions(projectId, query));
-  if (!sessions) return;
+  if (!state.projects.some((project) => project.id === projectId)) return;
   publish(
     updateRuntime(state, projectId, (runtime) => ({
       ...runtime,
-      sessions,
-      sessionsLoading: false,
+      sessionsLoading: true,
+      sessionsError: null,
     })),
   );
+  try {
+    const sessions = await desktop.listSessions(projectId, query);
+    publish(
+      updateRuntime(state, projectId, (runtime) => ({
+        ...runtime,
+        sessions,
+        sessionsLoading: false,
+        sessionsLoaded: true,
+        sessionsError: null,
+      })),
+    );
+  } catch (error) {
+    const message = errorMessage(error);
+    patch({ error: message });
+    publish(
+      updateRuntime(state, projectId, (runtime) => ({
+        ...runtime,
+        sessionsLoading: false,
+        sessionsError: message,
+      })),
+    );
+  }
 }
 
 export const appStore = {
@@ -915,6 +944,9 @@ export const appStore = {
   clearError() {
     patch({ error: null });
   },
+  showError(message: string) {
+    patch({ error: message });
+  },
   clearNotification(projectId: string, notificationId?: string) {
     publish(
       updateRuntime(state, projectId, (runtime) => ({
@@ -929,7 +961,14 @@ export const appStore = {
     publish(next);
   },
   _setSessions(projectId: string, sessions: SessionSummary[]) {
-    publish(updateRuntime(state, projectId, (runtime) => ({ ...runtime, sessions })));
+    publish(
+      updateRuntime(state, projectId, (runtime) => ({
+        ...runtime,
+        sessions,
+        sessionsLoaded: true,
+        sessionsError: null,
+      })),
+    );
   },
   _setProviders(providers: ProviderCredentialStatus[]) {
     patch({ providers });

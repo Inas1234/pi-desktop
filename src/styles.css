@@ -21,7 +21,7 @@
   --success: #2f7d55;
   --warning: #a36c22;
   --error: #b94b45;
-  --sidebar-width: 236px;
+  --sidebar-width: 260px;
   --titlebar-height: 36px;
 }
 
@@ -450,6 +450,258 @@ textarea {
   font-size: 8px;
 }
 
+/* Project-first navigation: flat groups with sessions nested beneath each project. */
+.sidebar-brand {
+  height: 42px;
+  gap: 6px;
+  padding: 0 8px 0 11px;
+}
+.sidebar-brand-mode {
+  margin-left: auto;
+  color: var(--faint);
+  font-size: 8px;
+  font-weight: 400;
+}
+.sidebar-search {
+  display: flex;
+  height: 29px;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  margin: 7px 7px 5px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  color: var(--muted);
+  background: var(--subtle);
+}
+.sidebar-search:focus-within {
+  border-color: var(--ring);
+  background: var(--surface);
+}
+.sidebar-search input {
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  color: var(--fg);
+  background: transparent;
+  font-size: 9px;
+}
+.sidebar-search input::placeholder {
+  color: var(--faint);
+}
+.project-list {
+  min-height: 0;
+  flex: 1;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 2px 5px 10px;
+}
+.project-empty {
+  display: flex;
+  width: 100%;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  margin-top: 28px;
+  border: 0;
+  padding: 18px 14px;
+  color: var(--muted);
+  background: transparent;
+  text-align: center;
+}
+.project-empty strong {
+  color: var(--fg);
+  font-size: 10px;
+  font-weight: 600;
+}
+.project-empty span {
+  max-width: 190px;
+  color: var(--faint);
+  font-size: 8px;
+  line-height: 1.5;
+}
+.project-group {
+  margin-bottom: 3px;
+}
+.project-row {
+  display: flex;
+  min-height: 39px;
+  align-items: center;
+  gap: 1px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+}
+.project-group[data-active="true"] > .project-row {
+  border-color: var(--border);
+  background: var(--subtle);
+}
+.project-row:hover {
+  background: var(--hover);
+}
+.project-toggle {
+  display: grid;
+  width: 22px;
+  height: 30px;
+  flex: none;
+  place-items: center;
+  border: 0;
+  padding: 0;
+  color: var(--faint);
+  background: transparent;
+}
+.project-toggle svg {
+  transition: transform 140ms ease;
+}
+.project-toggle[aria-expanded="true"] svg {
+  transform: rotate(90deg);
+}
+.project-row-main {
+  display: flex;
+  min-width: 0;
+  height: 37px;
+  flex: 1;
+  align-items: center;
+  gap: 7px;
+  border: 0;
+  padding: 3px 1px;
+  color: var(--fg);
+  background: transparent;
+  text-align: left;
+}
+.project-icon {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  flex: none;
+  place-items: center;
+  border-radius: 3px;
+  color: var(--muted);
+  background: var(--surface);
+}
+.project-group[data-active="true"] .project-icon {
+  color: var(--fg);
+}
+.project-copy {
+  min-width: 0;
+  flex: 1;
+}
+.project-copy strong,
+.project-copy small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.project-copy strong {
+  font-size: 9px;
+  font-weight: 600;
+}
+.project-copy small {
+  margin-top: 2px;
+  color: var(--faint);
+  font-size: 7px;
+}
+.project-new-session {
+  margin-right: 3px;
+  opacity: 0;
+}
+.project-row:hover .project-new-session,
+.project-group[data-active="true"] .project-new-session,
+.project-new-session:focus-visible {
+  opacity: 1;
+}
+.project-sessions {
+  position: relative;
+  margin: 2px 0 6px 19px;
+  padding-left: 8px;
+  border-left: 1px solid var(--border);
+}
+.project-sessions .session-row {
+  min-height: 29px;
+  gap: 0;
+  border-radius: 3px;
+  padding: 0;
+}
+.project-sessions .session-row-open {
+  height: 29px;
+  gap: 5px;
+  overflow: hidden;
+  padding: 0 5px;
+  color: var(--muted);
+}
+.project-sessions .session-row[data-active="true"] .session-row-open {
+  color: var(--fg);
+}
+.project-sessions .session-prefix {
+  width: 8px;
+  font-size: 8px;
+}
+.project-sessions .session-row[data-active="true"] .session-prefix {
+  color: var(--info);
+}
+.project-sessions .session-row strong {
+  min-width: 0;
+  flex: 1;
+  font-size: 8px;
+  font-weight: 500;
+}
+.project-sessions .session-row time {
+  align-self: auto;
+  padding-top: 0;
+}
+.project-sessions .session-more {
+  margin-right: 2px;
+  border: 0;
+  background: transparent;
+}
+.project-sessions .sidebar-loading,
+.session-retry,
+.project-sessions .session-empty,
+.session-more-results {
+  width: 100%;
+  min-height: 28px;
+  border: 0;
+  padding: 6px 7px;
+  color: var(--faint);
+  background: transparent;
+  font-size: 8px;
+  text-align: left;
+}
+.project-sessions .sidebar-loading {
+  gap: 6px;
+}
+.session-retry:hover,
+.project-sessions .session-empty:not(:disabled):hover,
+.session-more-results:hover {
+  color: var(--fg);
+  background: var(--hover);
+}
+.project-sessions .session-empty:disabled {
+  opacity: 1;
+}
+.session-more-results {
+  color: var(--muted);
+}
+.sidebar-footer {
+  min-height: 38px;
+  height: auto;
+  padding: 4px 7px 4px 10px;
+}
+.trust-state {
+  min-width: 0;
+}
+.trust-state span,
+.trust-state small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.trust-state small {
+  color: var(--faint);
+}
+
 .workspace-header {
   position: absolute;
   top: 0;
@@ -469,6 +721,21 @@ textarea {
   display: flex;
   align-items: center;
   gap: 7px;
+}
+.workspace-header-session {
+  min-width: 0;
+}
+.workspace-header .workspace-header-actions {
+  margin-left: auto;
+  gap: 4px;
+  pointer-events: auto;
+}
+.workspace-package-button {
+  width: auto;
+  padding: 0 7px;
+}
+.workspace-package-button span {
+  font-size: 8px;
 }
 .workspace-header strong {
   max-width: 400px;
@@ -805,6 +1072,19 @@ textarea {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.tool-line-changes {
+  display: inline-flex;
+  flex: none;
+  gap: 4px;
+  font-size: 8px;
+  font-variant-numeric: tabular-nums;
+}
+.tool-lines-added {
+  color: var(--success);
+}
+.tool-lines-removed {
+  color: var(--error);
+}
 .tool-state {
   display: block;
   width: auto;
@@ -1075,7 +1355,9 @@ textarea {
   right: 0;
   bottom: calc(100% + 6px);
   left: 0;
-  overflow: hidden;
+  max-height: min(460px, 60vh);
+  overflow-x: hidden;
+  overflow-y: auto;
   border: 1px solid var(--border);
   border-radius: 3px;
   background: var(--surface);
@@ -1094,15 +1376,30 @@ textarea {
   background: var(--hover);
 }
 .command-suggestions strong {
+  flex: none;
   font-family: inherit;
   font-size: 10px;
 }
+.command-suggestions strong small {
+  color: var(--faint);
+  font-size: 8px;
+  font-weight: 400;
+}
 .command-suggestions span {
+  min-width: 0;
+  flex: 1;
   overflow: hidden;
   color: var(--muted);
   font-size: 10px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.command-suggestions em {
+  flex: none;
+  align-self: center;
+  color: var(--faint);
+  font-size: 7px;
+  font-style: normal;
 }
 .extension-widget {
   margin: 0 8px 6px;

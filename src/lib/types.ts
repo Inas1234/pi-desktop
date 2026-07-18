@@ -203,6 +203,8 @@ export interface PiCommand {
   name: string;
   description?: string;
   source?: string;
+  argumentHint?: string;
+  invocation?: "interactive" | "prompt";
   [key: string]: unknown;
 }
 
@@ -276,6 +278,8 @@ export interface ProjectRuntime {
   stats: Record<string, unknown>;
   sessions: SessionSummary[];
   sessionsLoading: boolean;
+  sessionsLoaded: boolean;
+  sessionsError: string | null;
   historyCursor: string | null;
   hasOlder: boolean;
   historyLoading: boolean;

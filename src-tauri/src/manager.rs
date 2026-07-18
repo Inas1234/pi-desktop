@@ -52,6 +52,7 @@ struct ProjectRuntime {
     token: String,
     stdin: Mutex<ChildStdin>,
     pending: Mutex<HashMap<String, oneshot::Sender<AppResult<Value>>>>,
+    command_catalog: ParkingMutex<Option<Vec<Value>>>,
     control: mpsc::Sender<ProcessControl>,
     termination: Mutex<Option<oneshot::Receiver<()>>>,
     settled: AtomicBool,
@@ -273,6 +274,7 @@ impl ProjectManager {
             token: Uuid::new_v4().to_string(),
             stdin: Mutex::new(stdin),
             pending: Mutex::new(HashMap::new()),
+            command_catalog: ParkingMutex::new(None),
             control: control_tx,
             termination: Mutex::new(Some(termination_rx)),
             settled: AtomicBool::new(true),
@@ -578,7 +580,7 @@ impl ProjectManager {
     async fn bootstrap_project(&self, project_id: &str) -> AppResult<()> {
         let state = data(self.rpc(project_id, object("get_state")).await?);
         let models_response = data(self.rpc(project_id, object("get_available_models")).await?);
-        let commands_response = data(self.rpc(project_id, object("get_commands")).await?);
+        let commands = self.command_catalog(project_id).await?;
         let stats =
             data(self.rpc(project_id, object("get_session_stats")).await?).unwrap_or(Value::Null);
 
@@ -609,7 +611,6 @@ impl ProjectManager {
             (messages, None, false)
         };
         let models = array_field(models_response.as_ref(), "models");
-        let commands = array_field(commands_response.as_ref(), "commands");
         let session_id = state
             .get("sessionId")
             .and_then(Value::as_str)
@@ -640,6 +641,31 @@ impl ProjectManager {
             },
         );
         Ok(())
+    }
+
+    async fn command_catalog(&self, project_id: &str) -> AppResult<Vec<Value>> {
+        let runtime = self
+            .runtimes
+            .read()
+            .await
+            .get(project_id)
+            .cloned()
+            .ok_or(AppError::PiNotRunning)?;
+        if let Some(commands) = runtime.command_catalog.lock().as_ref() {
+            return Ok(commands.clone());
+        }
+
+        let response = match self.rpc(project_id, object("get_command_catalog")).await {
+            Ok(response) => response,
+            Err(error) if is_unknown_command(&error, "get_command_catalog") => {
+                self.rpc(project_id, object("get_commands")).await?
+            }
+            Err(error) => return Err(error),
+        };
+        let response_data = data(response);
+        let commands = array_field(response_data.as_ref(), "commands");
+        *runtime.command_catalog.lock() = Some(commands.clone());
+        Ok(commands)
     }
 
     fn emit(&self, project_id: &str, session_id: Option<String>, event: AppEventKind) {
@@ -781,6 +807,9 @@ async fn stdout_loop(
         {
             let _ = sender.send(Ok(value));
             continue;
+        }
+        if value.get("type").and_then(Value::as_str) == Some("command_catalog_changed") {
+            *runtime.command_catalog.lock() = None;
         }
         projection::project_event(&mut value);
         let settled = value.get("type").and_then(Value::as_str) == Some("agent_settled");
@@ -1095,6 +1124,10 @@ fn array_field(value: Option<&Value>, field: &str) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+fn is_unknown_command(error: &AppError, command: &str) -> bool {
+    matches!(error, AppError::Message(message) if message == &format!("Unknown command: {command}"))
+}
+
 fn encode_image(path: &Path) -> AppResult<Value> {
     let metadata = std::fs::metadata(path)?;
     if metadata.len() > MAX_IMAGE_BYTES {
@@ -1121,7 +1154,9 @@ fn now_millis() -> u64 {
 mod tests {
     use serde_json::json;
 
-    use super::{is_high_frequency, merge_event};
+    use crate::error::AppError;
+
+    use super::{is_high_frequency, is_unknown_command, merge_event};
 
     #[test]
     fn combines_adjacent_text_deltas() {
@@ -1147,5 +1182,17 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_slice(b"{\"text\":\"a\xE2\x80\xA8b\"}").unwrap();
         assert_eq!(value["text"], "a\u{2028}b");
+    }
+
+    #[test]
+    fn recognizes_only_the_expected_unknown_catalog_response() {
+        assert!(is_unknown_command(
+            &AppError::Message("Unknown command: get_command_catalog".into()),
+            "get_command_catalog"
+        ));
+        assert!(!is_unknown_command(
+            &AppError::Message("Catalog failed".into()),
+            "get_command_catalog"
+        ));
     }
 }

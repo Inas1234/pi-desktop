@@ -31,22 +31,35 @@ export const DESKTOP_SLASH_COMMANDS: readonly PiCommand[] = [
 export function matchingSlashCommands(
   text: string,
   piCommands: readonly PiCommand[],
-  limit = 6,
+  limit = 40,
 ): PiCommand[] {
   const match = /^\/([^\s]*)$/.exec(text);
   if (!match) return [];
 
   const query = match[1].toLowerCase();
   const commands = new Map<string, PiCommand>();
-  for (const command of [...DESKTOP_SLASH_COMMANDS, ...piCommands]) {
+  for (const command of [...piCommands, ...DESKTOP_SLASH_COMMANDS]) {
     const name = typeof command.name === "string" ? command.name.trim() : "";
-    if (!name || commands.has(name.toLowerCase())) continue;
-    commands.set(name.toLowerCase(), { ...command, name });
+    if (!name) continue;
+    const key = name.toLowerCase();
+    const existing = commands.get(key);
+    if (existing) {
+      if (command.source === "desktop") {
+        commands.set(
+          key,
+          existing.source === "builtin" ? { ...existing, source: "desktop" } : { ...command, name },
+        );
+      }
+      continue;
+    }
+    commands.set(key, { ...command, name });
   }
 
   return [...commands.values()]
     .filter((command) =>
-      `${command.name} ${command.description ?? ""}`.toLowerCase().includes(query),
+      `${command.name} ${command.argumentHint ?? ""} ${command.description ?? ""}`
+        .toLowerCase()
+        .includes(query),
     )
     .slice(0, limit);
 }
@@ -56,4 +69,22 @@ export function desktopSlashCommand(text: string): string | null {
   if (!match) return null;
   const name = match[1].toLowerCase();
   return DESKTOP_SLASH_COMMANDS.some((command) => command.name === name) ? name : null;
+}
+
+export function interactiveSlashCommand(
+  text: string,
+  piCommands: readonly PiCommand[],
+): PiCommand | null {
+  const match = /^\/([^\s]+)(?:\s.*)?$/.exec(text.trim());
+  if (!match) return null;
+  const name = match[1].toLowerCase();
+  return (
+    piCommands.find(
+      (command) =>
+        typeof command.name === "string" &&
+        command.name.toLowerCase() === name &&
+        command.source === "builtin" &&
+        command.invocation === "interactive",
+    ) ?? null
+  );
 }

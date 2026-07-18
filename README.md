@@ -39,7 +39,10 @@ There is no embedded Node backend and no second conversation database.
 
 - Type `/` in the composer to open slash-command autocomplete.
 - Use desktop commands: `/new`, `/model`, `/settings`, `/login`, and `/packages`.
-- Merge Pi extension commands, prompt templates, and skill commands into the same autocomplete.
+- Retrieve Pi's complete command catalog when supported, preserving CLI order and metadata, and
+  merge extension commands, prompt templates, skills, and Desktop actions into one autocomplete.
+- Label terminal-only Pi commands and prevent unsupported slash syntax from being sent as a model
+  prompt.
 - Navigate suggestions with Up/Down, complete with Tab or Enter, and dismiss with Escape.
 - Support queued Pi extension UI requests for select, confirm, input, editor, notifications,
   status, above/below-composer widgets, titles, and editor-text updates.

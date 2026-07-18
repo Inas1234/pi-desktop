@@ -1,7 +1,8 @@
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
-  ChevronDown,
+  ChevronRight,
+  Folder,
   FolderPlus,
   LoaderCircle,
   MessageSquarePlus,
@@ -12,7 +13,7 @@ import {
   ShieldOff,
   Trash2,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -23,34 +24,87 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { desktop } from "@/lib/bridge";
+import type { SessionSummary } from "@/lib/types";
 import { relativeTime } from "@/lib/utils";
 import { appStore, useAppStore } from "@/stores/app-store";
+
+const INITIAL_SESSION_LIMIT = 8;
+
+function matchesSession(session: SessionSummary, query: string) {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return true;
+  return `${session.name ?? ""} ${session.preview ?? ""}`.toLowerCase().includes(needle);
+}
+
+function sessionTitle(session: SessionSummary) {
+  return session.name || session.preview || "New session";
+}
 
 export function Sidebar() {
   const openSidebar = useAppStore((snapshot) => snapshot.sidebarOpen);
   const projects = useAppStore((snapshot) => snapshot.projects);
   const activeProjectId = useAppStore((snapshot) => snapshot.activeProjectId);
-  const runtime = useAppStore((snapshot) =>
-    activeProjectId ? snapshot.runtimes[activeProjectId] : undefined,
-  );
+  const runtimes = useAppStore((snapshot) => snapshot.runtimes);
   const activeProject = projects.find((project) => project.id === activeProjectId);
   const [query, setQuery] = useState("");
   const [pendingPath, setPendingPath] = useState<string | null>(null);
+  const [expandedProjectIds, setExpandedProjectIds] = useState<Set<string>>(
+    () => new Set(activeProjectId ? [activeProjectId] : []),
+  );
+  const [sessionLimits, setSessionLimits] = useState<Record<string, number>>({});
 
   useEffect(() => {
     if (!activeProjectId) return;
-    const timeout = window.setTimeout(
-      () => void appStore.refreshSessions(activeProjectId, query),
-      180,
-    );
-    return () => clearTimeout(timeout);
-  }, [activeProjectId, query]);
+    setExpandedProjectIds((current) => {
+      if (current.has(activeProjectId)) return current;
+      const next = new Set(current);
+      next.add(activeProjectId);
+      return next;
+    });
+  }, [activeProjectId]);
 
-  const sessions = useMemo(() => runtime?.sessions ?? [], [runtime?.sessions]);
+  useEffect(() => {
+    for (const project of projects) {
+      const runtime = runtimes[project.id];
+      if (
+        expandedProjectIds.has(project.id) &&
+        runtime &&
+        !runtime.sessionsLoaded &&
+        !runtime.sessionsLoading &&
+        !runtime.sessionsError
+      ) {
+        void appStore.refreshSessions(project.id);
+      }
+    }
+  }, [expandedProjectIds, projects, runtimes]);
 
   async function chooseProject() {
     const selected = await open({ directory: true, multiple: false, title: "Open a project" });
     if (typeof selected === "string") setPendingPath(selected);
+  }
+
+  function toggleProject(projectId: string) {
+    setExpandedProjectIds((current) => {
+      const next = new Set(current);
+      if (next.has(projectId)) next.delete(projectId);
+      else next.add(projectId);
+      return next;
+    });
+  }
+
+  async function selectProject(projectId: string) {
+    setExpandedProjectIds((current) => new Set(current).add(projectId));
+    await appStore.selectProject(projectId);
+  }
+
+  async function createSession(projectId: string) {
+    if (projectId !== activeProjectId) await appStore.selectProject(projectId);
+    await appStore.newSession(projectId);
+  }
+
+  async function openSession(projectId: string, sessionPath: string) {
+    if (projectId !== activeProjectId) await appStore.selectProject(projectId);
+    await appStore.openSession(projectId, sessionPath);
   }
 
   return (
@@ -59,146 +113,204 @@ export function Sidebar() {
         <div className="sidebar-brand">
           <span className="sidebar-wordmark">π_</span>
           <span>pi</span>
-          <small>rpc</small>
+          <span className="sidebar-brand-mode">desktop</span>
+          <Button
+            variant="ghost"
+            size="compact"
+            aria-label="Open project"
+            title="Open project"
+            onClick={() => void chooseProject()}
+          >
+            <FolderPlus size={14} />
+          </Button>
         </div>
 
-        <DropdownMenu.Root>
-          <DropdownMenu.Trigger asChild>
-            <button type="button" className="project-switcher" aria-label="Switch project">
-              <span className="project-glyph">{activeProject ? "~/" : "--"}</span>
-              <span className="project-switcher-copy">
-                <strong>{activeProject?.name ?? "No project"}</strong>
-                <small>{activeProject?.path ?? "Open a folder to begin"}</small>
-              </span>
-              {runtime?.connection === "starting" ? (
-                <LoaderCircle className="spin" size={14} />
-              ) : (
-                <span className={`run-dot ${runtime?.isStreaming ? "active" : ""}`} />
-              )}
-              <ChevronDown size={14} />
+        {projects.length > 0 && (
+          <label className="sidebar-search">
+            <Search size={12} />
+            <input
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="Search sessions"
+              aria-label="Search sessions"
+            />
+          </label>
+        )}
+
+        <div className="project-list">
+          {!projects.length && (
+            <button type="button" className="project-empty" onClick={() => void chooseProject()}>
+              <FolderPlus size={15} />
+              <strong>Open a project</strong>
+              <span>Projects and their Pi sessions will appear here.</span>
             </button>
-          </DropdownMenu.Trigger>
-          <DropdownMenu.Portal>
-            <DropdownMenu.Content className="menu-content" sideOffset={6} align="start">
-              {projects.map((project) => {
-                const projectRuntime = appStore.getSnapshot().runtimes[project.id];
-                return (
-                  <DropdownMenu.Item
-                    className="menu-project"
-                    key={project.id}
-                    onSelect={() => void appStore.selectProject(project.id)}
+          )}
+
+          {projects.map((project) => {
+            const runtime = runtimes[project.id];
+            const expanded = expandedProjectIds.has(project.id);
+            const filteredSessions = (runtime?.sessions ?? []).filter((session) =>
+              matchesSession(session, query),
+            );
+            const limit = sessionLimits[project.id] ?? INITIAL_SESSION_LIMIT;
+            const visibleSessions = filteredSessions.slice(0, limit);
+
+            return (
+              <section
+                className="project-group"
+                data-active={project.id === activeProjectId}
+                key={project.id}
+              >
+                <div className="project-row">
+                  <button
+                    type="button"
+                    className="project-toggle"
+                    aria-label={`${expanded ? "Collapse" : "Expand"} ${project.name}`}
+                    aria-expanded={expanded}
+                    onClick={() => toggleProject(project.id)}
                   >
-                    <span className="project-glyph small">~/</span>
-                    <span>
+                    <ChevronRight size={13} />
+                  </button>
+                  <button
+                    type="button"
+                    className="project-row-main"
+                    aria-label={`Select project ${project.name}`}
+                    onClick={() => void selectProject(project.id)}
+                  >
+                    <span className="project-icon">
+                      <Folder size={13} />
+                    </span>
+                    <span className="project-copy">
                       <strong>{project.name}</strong>
                       <small>{project.path}</small>
                     </span>
-                    <span className={`run-dot ${projectRuntime?.isStreaming ? "active" : ""}`} />
-                  </DropdownMenu.Item>
-                );
-              })}
-              {projects.length > 0 && <DropdownMenu.Separator className="menu-separator" />}
-              <DropdownMenu.Item className="menu-item" onSelect={() => void chooseProject()}>
-                <FolderPlus size={14} /> Open project
-              </DropdownMenu.Item>
-            </DropdownMenu.Content>
-          </DropdownMenu.Portal>
-        </DropdownMenu.Root>
+                    {runtime?.connection === "starting" ? (
+                      <LoaderCircle className="spin" size={12} />
+                    ) : (
+                      <span className={`run-dot ${runtime?.isStreaming ? "active" : ""}`} />
+                    )}
+                  </button>
+                  <Button
+                    className="project-new-session"
+                    variant="ghost"
+                    size="compact"
+                    aria-label={`New session in ${project.name}`}
+                    title={`New session in ${project.name}`}
+                    onClick={() => void createSession(project.id)}
+                  >
+                    <MessageSquarePlus size={13} />
+                  </Button>
+                </div>
 
-        {activeProject && (
-          <>
-            <div className="session-tools">
-              <label className="session-search">
-                <Search size={12} />
-                <input
-                  value={query}
-                  onChange={(event) => setQuery(event.target.value)}
-                  placeholder="filter sessions"
-                  aria-label="Search sessions"
-                />
-              </label>
-              <Button
-                variant="ghost"
-                size="compact"
-                title="New session"
-                aria-label="New session"
-                onClick={() => void appStore.newSession(activeProject.id)}
-              >
-                <MessageSquarePlus size={14} />
-              </Button>
-            </div>
-            <div className="sidebar-section-label">
-              <span>sessions</span>
-              <small>{sessions.length}</small>
-            </div>
-          </>
-        )}
+                {expanded && (
+                  <div className="project-sessions">
+                    {runtime?.sessionsLoading && !runtime.sessionsLoaded && (
+                      <div className="sidebar-loading">
+                        <LoaderCircle className="spin" size={12} /> Loading sessions
+                      </div>
+                    )}
 
-        <div className="session-list">
-          {runtime?.sessionsLoading && !sessions.length && (
-            <div className="sidebar-loading">
-              <LoaderCircle className="spin" size={14} /> Loading sessions
-            </div>
-          )}
-          {!runtime?.sessionsLoading && activeProject && !sessions.length && (
-            <button
-              type="button"
-              className="session-empty"
-              onClick={() => void appStore.newSession(activeProject.id)}
-            >
-              Start a new session
-              <span>Your Pi history stays in Pi’s JSONL files.</span>
-            </button>
-          )}
-          {sessions.map((session) => (
-            <div className="session-row" data-active={session.isActive} key={session.path}>
-              <button
-                type="button"
-                className="session-row-open"
-                onClick={() =>
-                  activeProject && void appStore.openSession(activeProject.id, session.path)
-                }
-              >
-                <span className="session-prefix">{session.isActive ? ">" : "·"}</span>
-                <span className="session-row-copy">
-                  <strong>{session.name || session.preview || "New session"}</strong>
-                  <small>{session.preview || `${session.messageCount} messages`}</small>
-                </span>
-                <time>{relativeTime(session.updatedAt)}</time>
-              </button>
-              {!session.isActive && activeProject && (
-                <DropdownMenu.Root>
-                  <DropdownMenu.Trigger asChild>
-                    <button type="button" className="session-more" aria-label="Session menu">
-                      <MoreHorizontal size={14} />
-                    </button>
-                  </DropdownMenu.Trigger>
-                  <DropdownMenu.Portal>
-                    <DropdownMenu.Content className="menu-content" side="right" align="start">
-                      <DropdownMenu.Item
-                        className="menu-item danger-text"
-                        onSelect={() =>
-                          void desktop
-                            .trashSession(activeProject.id, session.path)
-                            .then(() => appStore.refreshSessions(activeProject.id))
+                    {!runtime?.sessionsLoading && runtime?.sessionsError && (
+                      <button
+                        type="button"
+                        className="session-retry"
+                        onClick={() => void appStore.refreshSessions(project.id)}
+                      >
+                        Retry loading sessions
+                      </button>
+                    )}
+
+                    {runtime?.sessionsLoaded && !filteredSessions.length && (
+                      <button
+                        type="button"
+                        className="session-empty"
+                        disabled={Boolean(query.trim())}
+                        onClick={() => void createSession(project.id)}
+                      >
+                        {query.trim() ? "No matching sessions" : "Start a new session"}
+                      </button>
+                    )}
+
+                    {visibleSessions.map((session) => {
+                      const title = sessionTitle(session);
+                      const selected = project.id === activeProjectId && session.isActive;
+                      return (
+                        <div className="session-row" data-active={selected} key={session.path}>
+                          <button
+                            type="button"
+                            className="session-row-open"
+                            aria-label={`Open session ${title}`}
+                            onClick={() => void openSession(project.id, session.path)}
+                          >
+                            <span className="session-prefix">{selected ? ">" : "·"}</span>
+                            <strong>{title}</strong>
+                            <time>{relativeTime(session.updatedAt)}</time>
+                          </button>
+                          {!session.isActive && (
+                            <DropdownMenu.Root>
+                              <DropdownMenu.Trigger asChild>
+                                <button
+                                  type="button"
+                                  className="session-more"
+                                  aria-label={`Session menu for ${title}`}
+                                >
+                                  <MoreHorizontal size={13} />
+                                </button>
+                              </DropdownMenu.Trigger>
+                              <DropdownMenu.Portal>
+                                <DropdownMenu.Content
+                                  className="menu-content"
+                                  side="right"
+                                  align="start"
+                                >
+                                  <DropdownMenu.Item
+                                    className="menu-item danger-text"
+                                    onSelect={() =>
+                                      void desktop
+                                        .trashSession(project.id, session.path)
+                                        .then(() => appStore.refreshSessions(project.id))
+                                    }
+                                  >
+                                    <Trash2 size={14} /> Move to Recycle Bin
+                                  </DropdownMenu.Item>
+                                </DropdownMenu.Content>
+                              </DropdownMenu.Portal>
+                            </DropdownMenu.Root>
+                          )}
+                        </div>
+                      );
+                    })}
+
+                    {filteredSessions.length > visibleSessions.length && (
+                      <button
+                        type="button"
+                        className="session-more-results"
+                        onClick={() =>
+                          setSessionLimits((current) => ({
+                            ...current,
+                            [project.id]: limit + INITIAL_SESSION_LIMIT,
+                          }))
                         }
                       >
-                        <Trash2 size={14} /> Move to Recycle Bin
-                      </DropdownMenu.Item>
-                    </DropdownMenu.Content>
-                  </DropdownMenu.Portal>
-                </DropdownMenu.Root>
-              )}
-            </div>
-          ))}
+                        Show {Math.min(INITIAL_SESSION_LIMIT, filteredSessions.length - limit)} more
+                      </button>
+                    )}
+                  </div>
+                )}
+              </section>
+            );
+          })}
         </div>
 
         <div className="sidebar-footer">
-          {activeProject && (
+          {activeProject ? (
             <div className="trust-state" title="Project trust controls project-local Pi resources">
               {activeProject.trusted ? <ShieldCheck size={13} /> : <ShieldOff size={13} />}
-              {activeProject.trusted ? "Trusted" : "Restricted"}
+              <span>{activeProject.trusted ? "Trusted" : "Restricted"}</span>
+              <small>{activeProject.name}</small>
             </div>
+          ) : (
+            <span />
           )}
           <Button
             variant="ghost"

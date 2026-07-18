@@ -4,7 +4,11 @@ import { ArrowUp, ChevronDown, CircleStop, ImagePlus, Paperclip, X } from "lucid
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
-import { desktopSlashCommand, matchingSlashCommands } from "@/lib/slash-commands";
+import {
+  desktopSlashCommand,
+  interactiveSlashCommand,
+  matchingSlashCommands,
+} from "@/lib/slash-commands";
 import type { ProjectRecord, ProjectRuntime, ThinkingLevel } from "@/lib/types";
 import { compactNumber, fileName } from "@/lib/utils";
 import { appStore } from "@/stores/app-store";
@@ -103,6 +107,15 @@ export function Composer({
   function submit(behavior?: "prompt" | "steer" | "follow_up") {
     if (!text.trim() && !images.length) return;
     if (!images.length && runDesktopCommand(text)) return;
+    const interactiveCommand = !images.length
+      ? interactiveSlashCommand(text, runtime.commands)
+      : null;
+    if (interactiveCommand) {
+      appStore.showError(
+        `/${interactiveCommand.name} is provided by Pi's terminal UI and is not available in Desktop yet.`,
+      );
+      return;
+    }
     const mode = behavior ?? (runtime.isStreaming ? "steer" : "prompt");
     const value = text;
     const attachments = images;
@@ -154,8 +167,12 @@ export function Composer({
                 onMouseDown={(event) => event.preventDefault()}
                 onClick={() => completeCommand(command)}
               >
-                <strong>/{command.name}</strong>
+                <strong>
+                  /{command.name}
+                  {command.argumentHint && <small> {command.argumentHint}</small>}
+                </strong>
                 <span>{command.description}</span>
+                {command.source === "builtin" && <em>CLI</em>}
               </button>
             ))}
           </div>

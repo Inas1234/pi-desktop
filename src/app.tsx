@@ -10,6 +10,7 @@ import { PiMark } from "@/components/pi-mark";
 import { Sidebar } from "@/components/sidebar";
 import { TitleBar } from "@/components/title-bar";
 import { Button } from "@/components/ui/button";
+import { WorkspaceHeader } from "@/components/workspace-header";
 import { desktop } from "@/lib/bridge";
 import { appStore, useAppStore } from "@/stores/app-store";
 
@@ -140,24 +141,7 @@ export default function App() {
                 </div>
               ) : (
                 <>
-                  <div className="workspace-header">
-                    <div>
-                      <strong>/ {runtime.state.sessionName || "new session"}</strong>
-                      <span className={`connection-dot ${runtime.connection}`} />{" "}
-                      <small>
-                        {runtime.connection === "starting"
-                          ? "Starting Pi"
-                          : runtime.isStreaming
-                            ? "Pi is working"
-                            : runtime.connection === "connected"
-                              ? "Ready"
-                              : runtime.connection}
-                      </small>
-                    </div>
-                    {runtime.state.isCompacting && (
-                      <span className="compact-state">Compacting context…</span>
-                    )}
-                  </div>
+                  <WorkspaceHeader runtime={runtime} />
                   {runtime.connection === "error" && (
                     <div className="connection-error">
                       <span>{runtime.connectionMessage}</span>
