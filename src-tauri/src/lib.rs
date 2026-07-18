@@ -1,5 +1,6 @@
 #![cfg_attr(not(feature = "desktop"), allow(dead_code))]
 
+mod catalog;
 mod commands;
 mod config;
 mod credentials;
@@ -7,6 +8,8 @@ mod diagnostics;
 mod error;
 mod manager;
 mod models;
+mod packages;
+mod projection;
 mod providers;
 mod sessions;
 mod windows_job;
@@ -22,6 +25,8 @@ use config::ConfigStore;
 use credentials::CredentialStore;
 #[cfg(feature = "desktop")]
 use manager::ProjectManager;
+#[cfg(feature = "desktop")]
+use packages::PiPackageManager;
 
 #[cfg(feature = "desktop")]
 pub fn run() {
@@ -32,6 +37,7 @@ pub fn run() {
 
     let config = Arc::new(ConfigStore::load().expect("unable to load Pi Desktop configuration"));
     let credentials = Arc::new(CredentialStore);
+    let packages = PiPackageManager::new(config.clone());
     let manager = ProjectManager::new(config, credentials);
     let setup_manager = manager.clone();
     let shutdown_manager = manager.clone();
@@ -40,7 +46,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
-        .manage(AppState { manager })
+        .manage(AppState { manager, packages })
         .setup(move |_| {
             setup_manager.start_idle_reaper();
             Ok(())
@@ -74,6 +80,12 @@ pub fn run() {
             commands::get_settings,
             commands::update_settings,
             commands::open_pi_login,
+            commands::list_pi_packages,
+            commands::browse_pi_package_catalog,
+            commands::run_pi_package_operation,
+            commands::cancel_pi_package_operation,
+            commands::reload_pi_resources,
+            commands::open_pi_package_config,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Pi Desktop");

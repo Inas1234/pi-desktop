@@ -4,8 +4,15 @@ import type {
   AppEvent,
   AppSettings,
   BootstrapState,
+  PackageCatalogPage,
+  PackageCatalogQuery,
+  PackageOperationRequest,
+  PackageOperationResult,
+  PackageProgress,
+  PackageScope,
   PiEnvironmentReport,
   PiModel,
+  PiPackageRecord,
   ProjectRecord,
   ProviderCredentialStatus,
   SessionPage,
@@ -81,6 +88,28 @@ export const desktop = {
     call<void>("set_thinking_level", { projectId, level }),
   respondExtensionUI: (projectId: string, requestId: string, response: unknown) =>
     call<void>("respond_extension_ui", { projectId, requestId, response }),
+  listPiPackages: (projectId: string) => call<PiPackageRecord[]>("list_pi_packages", { projectId }),
+  browsePiPackageCatalog: (query: PackageCatalogQuery) =>
+    call<PackageCatalogPage>("browse_pi_package_catalog", { query }),
+  async runPiPackageOperation(
+    projectId: string,
+    request: PackageOperationRequest,
+    onProgress: (progress: PackageProgress) => void,
+  ) {
+    if (!isTauri()) throw new Error("This action is available in the desktop app");
+    const channel = new Channel<PackageProgress>();
+    channel.onmessage = onProgress;
+    return invoke<PackageOperationResult>("run_pi_package_operation", {
+      projectId,
+      request,
+      onProgress: channel,
+    });
+  },
+  cancelPiPackageOperation: (operationId: string) =>
+    call<boolean>("cancel_pi_package_operation", { operationId }),
+  reloadPiResources: (projectId: string) => call<string[]>("reload_pi_resources", { projectId }),
+  openPiPackageConfig: (projectId: string, scope: PackageScope) =>
+    call<void>("open_pi_package_config", { projectId, scope }),
   listProviderCredentials: () => call<ProviderCredentialStatus[]>("list_provider_credentials"),
   setProviderKey: (providerId: string, secret: string) =>
     call<ProviderCredentialStatus[]>("set_provider_key", { providerId, secret }),

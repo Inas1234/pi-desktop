@@ -22,6 +22,7 @@ function emptyState(): AppStoreState {
     sidebarOpen: true,
     settingsOpen: false,
     commandPaletteOpen: false,
+    packagesOpen: false,
     lastEventSeq: 0,
   };
 }
@@ -126,5 +127,195 @@ describe("Pi event reducer", () => {
 
     expect(current.runtimes.project.warning).toContain("Event gap");
     expect(current.runtimes.project.messages[0]).toMatchObject({ status: "error", isError: true });
+  });
+
+  it("preserves bounded custom tool details and arguments", () => {
+    let current = reduceEvent(emptyState(), {
+      seq: 1,
+      projectId: "project",
+      type: "pi_event",
+      event: {
+        type: "tool_execution_start",
+        toolCallId: "custom-tool",
+        toolName: "delegate",
+        args: { task: "review", agents: ["one", "two"] },
+        argsTruncated: true,
+      },
+    });
+    current = reduceEvent(current, {
+      seq: 2,
+      projectId: "project",
+      type: "pi_event",
+      event: {
+        type: "tool_execution_end",
+        toolCallId: "custom-tool",
+        toolName: "delegate",
+        result: {
+          content: [{ type: "text", text: "finished" }],
+          details: { agents: [{ name: "one", status: "done" }] },
+          detailsTruncated: true,
+        },
+      },
+    });
+
+    expect(current.runtimes.project.messages[0]).toMatchObject({
+      type: "tool",
+      args: { task: "review", agents: ["one", "two"] },
+      argsTruncated: true,
+      output: "finished",
+      details: { agents: [{ name: "one", status: "done" }] },
+      detailsTruncated: true,
+    });
+  });
+
+  it("renders displayable custom and future messages without duplicating lifecycle messages", () => {
+    const paged = normalizeMessages([
+      {
+        id: "custom",
+        role: "custom",
+        customType: "subagents",
+        display: true,
+        content: "Two agents completed",
+        details: { count: 2 },
+      },
+      { id: "hidden", role: "custom", customType: "state", display: false, content: "hidden" },
+      { id: "future", role: "workflow", content: "Future displayable content" },
+    ]);
+    expect(paged).toHaveLength(2);
+    expect(paged[0]).toMatchObject({
+      type: "custom",
+      label: "subagents",
+      text: "Two agents completed",
+      details: { count: 2 },
+    });
+    expect(paged[1]).toMatchObject({ type: "custom", label: "workflow" });
+
+    let current = reduceEvent(emptyState(), {
+      seq: 1,
+      projectId: "project",
+      type: "pi_event",
+      event: {
+        type: "message_start",
+        message: { id: "user", role: "user", content: "hello" },
+      },
+    });
+    current = reduceEvent(current, {
+      seq: 2,
+      projectId: "project",
+      type: "pi_event",
+      event: {
+        type: "message_end",
+        message: { id: "user", role: "user", content: "hello" },
+      },
+    });
+    current = reduceEvent(current, {
+      seq: 3,
+      projectId: "project",
+      type: "pi_event",
+      event: {
+        type: "message_start",
+        message: { id: "tool-result", role: "toolResult", content: "handled by tool events" },
+      },
+    });
+    expect(current.runtimes.project.messages).toHaveLength(1);
+    expect(current.runtimes.project.messages[0]).toMatchObject({
+      type: "message",
+      role: "user",
+      complete: true,
+    });
+  });
+
+  it("queues extension dialogs and notifications while retaining widget placement and title", () => {
+    let current = emptyState();
+    const events = [
+      { type: "extension_ui_request", id: "first", method: "confirm", title: "First" },
+      { type: "extension_ui_request", id: "second", method: "input", title: "Second" },
+      {
+        type: "extension_ui_request",
+        id: "widget",
+        method: "setWidget",
+        widgetKey: "agents",
+        widgetLines: ["one", "two"],
+        widgetPlacement: "belowEditor",
+      },
+      {
+        type: "extension_ui_request",
+        id: "status",
+        method: "setStatus",
+        statusKey: "agents",
+        statusText: "running",
+      },
+      { type: "extension_ui_request", id: "title", method: "setTitle", title: "Agent team" },
+      ...Array.from({ length: 12 }, (_, index) => ({
+        type: "extension_ui_request",
+        id: `notice-${index}`,
+        method: "notify",
+        message: `notice ${index}`,
+        notifyType: index === 11 ? "unexpected" : "warning",
+      })),
+    ];
+    for (const [index, event] of events.entries()) {
+      current = reduceEvent(current, {
+        seq: index + 1,
+        projectId: "project",
+        type: "pi_event",
+        event,
+      });
+    }
+
+    const runtime = current.runtimes.project;
+    expect(runtime.extensionRequests.map((request) => request.id)).toEqual(["first", "second"]);
+    expect(runtime.notifications).toHaveLength(10);
+    expect(runtime.notifications.at(-1)).toMatchObject({ id: "notice-11", tone: "info" });
+    expect(runtime.widgets.agents).toEqual({
+      lines: ["one", "two"],
+      placement: "belowEditor",
+    });
+    expect(runtime.status.agents).toBe("running");
+    expect(runtime.extensionTitle).toBe("Agent team");
+
+    current = reduceEvent(current, {
+      seq: events.length + 1,
+      projectId: "project",
+      type: "extension_ui_expired",
+      requestId: "first",
+    });
+    expect(current.runtimes.project.extensionRequests.map((request) => request.id)).toEqual([
+      "second",
+    ]);
+  });
+
+  it("surfaces extension failures and clears transient UI when the process restarts", () => {
+    let current = reduceEvent(emptyState(), {
+      seq: 1,
+      projectId: "project",
+      type: "pi_event",
+      event: {
+        type: "extension_error",
+        extensionPath: "C:\\extensions\\agents.ts",
+        error: "failed to start",
+      },
+    });
+    current = reduceEvent(current, {
+      seq: 2,
+      projectId: "project",
+      type: "pi_event",
+      event: { type: "extension_ui_request", id: "title", method: "setTitle", title: "Custom" },
+    });
+    current = reduceEvent(current, {
+      seq: 3,
+      projectId: "project",
+      type: "connection",
+      state: "connecting",
+    });
+
+    expect(current.runtimes.project.messages[0]).toMatchObject({
+      type: "notice",
+      tone: "error",
+      text: "agents.ts: failed to start",
+    });
+    expect(current.runtimes.project.extensionTitle).toBeNull();
+    expect(current.runtimes.project.extensionRequests).toEqual([]);
+    expect(current.runtimes.project.widgets).toEqual({});
   });
 });

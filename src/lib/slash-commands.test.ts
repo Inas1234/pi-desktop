@@ -7,6 +7,7 @@ describe("slash commands", () => {
       "model",
       "settings",
       "login",
+      "packages",
     ]);
   });
 
@@ -33,6 +34,7 @@ describe("slash commands", () => {
 
   it("recognizes only commands handled by the desktop", () => {
     expect(desktopSlashCommand("/settings ")).toBe("settings");
+    expect(desktopSlashCommand("/packages ")).toBe("packages");
     expect(desktopSlashCommand("/skill:review ")).toBeNull();
   });
 });

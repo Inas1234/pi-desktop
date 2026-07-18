@@ -33,9 +33,11 @@ tauri-build = { version = "2.5", features = [] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 directories = "6"
+dom_query = "0.27"
 keyring = { version = "4.1", default-features = false, features = ["v1", "windows-native-keyring-store"] }
 mime_guess = "2"
 parking_lot = "0.12"
+reqwest = { version = "0.13", default-features = false, features = ["charset", "native-tls-no-alpn", "query"] }
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

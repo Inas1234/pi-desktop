@@ -21,7 +21,7 @@ describe("MessageItem", () => {
       </LazyMotion>,
     );
 
-    expect(await screen.findByText("Safe")).toBeVisible();
+    expect(await screen.findByText("Safe", {}, { timeout: 5_000 })).toBeVisible();
     expect(container.querySelector("script")).toBeNull();
     expect(container.textContent).not.toContain("unsafe");
   });

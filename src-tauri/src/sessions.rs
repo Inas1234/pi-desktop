@@ -8,12 +8,13 @@ use std::{
 };
 
 use parking_lot::RwLock;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::{
     credentials::pi_agent_dir,
     error::{AppError, AppResult},
     models::{ProjectRecord, SessionPage, SessionSummary},
+    projection,
 };
 
 const MAX_SESSION_LINE_BYTES: usize = 32 * 1024 * 1024;
@@ -25,7 +26,7 @@ struct IndexedEntry {
     length: usize,
     id: String,
     parent_id: Option<String>,
-    is_message: bool,
+    is_transcript: bool,
 }
 
 #[derive(Debug)]
@@ -136,7 +137,7 @@ pub fn load_message_page(
         let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
             continue;
         };
-        let Some(mut message) = value.get("message").cloned() else {
+        let Some(mut message) = project_transcript_entry(&value) else {
             continue;
         };
         if let Some(object) = message.as_object_mut() {
@@ -144,6 +145,7 @@ pub fn load_message_page(
                 .entry("id")
                 .or_insert_with(|| Value::String(entry.id.clone()));
         }
+        projection::project_message(&mut message);
         messages.push(message);
     }
     let has_older = start > 0;
@@ -220,7 +222,7 @@ fn build_index(
                 .get("parentId")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-            is_message: value.get("type").and_then(Value::as_str) == Some("message"),
+            is_transcript: is_transcript_entry(&value),
         });
     }
 
@@ -237,7 +239,7 @@ fn build_index(
             break;
         };
         let entry = &entries[entry_index];
-        if entry.is_message {
+        if entry.is_transcript {
             active_messages.push(entry_index);
         }
         current = entry.parent_id.as_deref();
@@ -254,6 +256,43 @@ fn build_index(
         entries,
         active_messages,
     })
+}
+
+fn is_transcript_entry(value: &Value) -> bool {
+    match value.get("type").and_then(Value::as_str) {
+        Some("message" | "branch_summary" | "compaction") => true,
+        Some("custom_message") => value.get("display").and_then(Value::as_bool) == Some(true),
+        _ => false,
+    }
+}
+
+fn project_transcript_entry(value: &Value) -> Option<Value> {
+    match value.get("type").and_then(Value::as_str)? {
+        "message" => value.get("message").cloned(),
+        "custom_message" if value.get("display").and_then(Value::as_bool) == Some(true) => {
+            Some(json!({
+                "role": "custom",
+                "customType": value.get("customType").and_then(Value::as_str).unwrap_or("extension"),
+                "content": value.get("content").cloned().unwrap_or(Value::Array(Vec::new())),
+                "details": value.get("details").cloned(),
+                "display": true,
+                "timestamp": value.get("timestamp").cloned(),
+            }))
+        }
+        "branch_summary" => Some(json!({
+            "role": "branchSummary",
+            "summary": value.get("summary").and_then(Value::as_str).unwrap_or_default(),
+            "fromId": value.get("fromId").cloned(),
+            "timestamp": value.get("timestamp").cloned(),
+        })),
+        "compaction" => Some(json!({
+            "role": "compactionSummary",
+            "summary": value.get("summary").and_then(Value::as_str).unwrap_or_default(),
+            "tokensBefore": value.get("tokensBefore").cloned(),
+            "timestamp": value.get("timestamp").cloned(),
+        })),
+        _ => None,
+    }
 }
 
 pub fn project_session_dir(project: &ProjectRecord) -> PathBuf {
@@ -475,5 +514,28 @@ mod tests {
         assert_eq!(older.messages.len(), 1);
         assert_eq!(older.messages[0]["id"], "a");
         assert!(!older.has_older);
+    }
+
+    #[test]
+    fn pages_displayable_custom_messages_but_hides_state_only_entries() {
+        let mut visible = NamedTempFile::new().unwrap();
+        writeln!(visible, r#"{{"type":"session","id":"session-1"}}"#).unwrap();
+        writeln!(visible, r#"{{"type":"message","id":"a","parentId":null,"message":{{"role":"user","content":"one"}}}}"#).unwrap();
+        writeln!(visible, r#"{{"type":"custom_message","id":"custom","parentId":"a","customType":"subagents","content":"two complete","display":true,"details":{{"count":2}}}}"#).unwrap();
+
+        let page = load_message_page(visible.path(), None, 10).unwrap();
+        assert_eq!(page.messages.len(), 2);
+        assert_eq!(page.messages[1]["role"], "custom");
+        assert_eq!(page.messages[1]["customType"], "subagents");
+        assert_eq!(page.messages[1]["details"]["count"], 2);
+
+        let mut hidden = NamedTempFile::new().unwrap();
+        writeln!(hidden, r#"{{"type":"session","id":"session-2"}}"#).unwrap();
+        writeln!(hidden, r#"{{"type":"message","id":"a","parentId":null,"message":{{"role":"user","content":"one"}}}}"#).unwrap();
+        writeln!(hidden, r#"{{"type":"custom_message","id":"state","parentId":"a","customType":"state","content":"hidden","display":false}}"#).unwrap();
+
+        let page = load_message_page(hidden.path(), None, 10).unwrap();
+        assert_eq!(page.messages.len(), 1);
+        assert_eq!(page.messages[0]["role"], "user");
     }
 }

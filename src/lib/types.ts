@@ -101,11 +101,11 @@ export interface PiMessage {
   toolCallId?: string;
   toolName?: string;
   isError?: boolean;
-  timestamp?: number;
+  timestamp?: number | string;
   [key: string]: unknown;
 }
 
-export type TranscriptItem = MessageItem | ToolItem | NoticeItem;
+export type TranscriptItem = MessageItem | ToolItem | CustomItem | NoticeItem;
 
 export interface MessageItem {
   id: string;
@@ -114,7 +114,7 @@ export interface MessageItem {
   text: string;
   reasoning: string;
   complete: boolean;
-  timestamp?: number;
+  timestamp?: number | string;
 }
 
 export interface ToolItem {
@@ -125,6 +125,20 @@ export interface ToolItem {
   output: string;
   status: "running" | "success" | "error";
   isError: boolean;
+  details: unknown | null;
+  detailsTruncated: boolean;
+  argsTruncated: boolean;
+}
+
+export interface CustomItem {
+  id: string;
+  type: "custom";
+  label: string;
+  text: string;
+  details: unknown | null;
+  detailsTruncated: boolean;
+  complete: boolean;
+  timestamp?: number | string;
 }
 
 export interface NoticeItem {
@@ -145,6 +159,17 @@ export interface ExtensionUIRequest {
   prefill?: string;
   timeout?: number;
   [key: string]: unknown;
+}
+
+export interface ExtensionNotification {
+  id: string;
+  message: string;
+  tone: "info" | "warning" | "error";
+}
+
+export interface ExtensionWidget {
+  lines: string[];
+  placement: "aboveEditor" | "belowEditor";
 }
 
 interface EventBase {
@@ -170,6 +195,7 @@ export type AppEvent = EventBase &
     | { type: "pi_events"; events: Record<string, unknown>[] }
     | { type: "process_exited"; code?: number | null; expected: boolean }
     | { type: "protocol_warning"; message: string }
+    | { type: "extension_ui_expired"; requestId: string }
     | { type: "resync_required"; reason: string }
   );
 
@@ -178,6 +204,66 @@ export interface PiCommand {
   description?: string;
   source?: string;
   [key: string]: unknown;
+}
+
+export type PackageScope = "user" | "project";
+
+export interface PiPackageRecord {
+  source: string;
+  scope: PackageScope;
+  installedPath?: string | null;
+  filtered: boolean;
+}
+
+export type PackageCatalogType = "" | "extension" | "skill" | "theme" | "prompt";
+export type PackageCatalogSort = "downloads" | "recent" | "name";
+
+export interface PackageCatalogQuery {
+  name?: string | null;
+  packageType?: PackageCatalogType | null;
+  sort?: PackageCatalogSort | null;
+  page?: number | null;
+}
+
+export interface PackageCatalogItem {
+  name: string;
+  description: string;
+  author: string;
+  downloads: number;
+  published: string;
+  types: string[];
+  npmUrl: string;
+  repositoryUrl?: string | null;
+  detailUrl: string;
+}
+
+export interface PackageCatalogPage {
+  items: PackageCatalogItem[];
+  page: number;
+  pageCount: number;
+  total: number;
+  from: number;
+  to: number;
+}
+
+export type PackageOperationKind = "install" | "remove" | "update" | "update_all";
+
+export interface PackageOperationRequest {
+  kind: PackageOperationKind;
+  source?: string | null;
+  scope?: PackageScope | null;
+}
+
+export interface PackageProgress {
+  operationId: string;
+  phase: "started" | "output" | "restarting" | "complete";
+  message: string;
+}
+
+export interface PackageOperationResult {
+  packages: PiPackageRecord[];
+  restartedProjectIds: string[];
+  warnings: string[];
 }
 
 export interface ProjectRuntime {
@@ -196,11 +282,12 @@ export interface ProjectRuntime {
   isStreaming: boolean;
   isSettled: boolean;
   currentAssistantId: string | null;
-  extensionRequest: ExtensionUIRequest | null;
+  extensionRequests: ExtensionUIRequest[];
   composerText: string | null;
-  notification: { message: string; tone: string } | null;
+  notifications: ExtensionNotification[];
   status: Record<string, string>;
-  widgets: Record<string, string[]>;
+  widgets: Record<string, ExtensionWidget>;
+  extensionTitle: string | null;
   warning: string | null;
 }
 
@@ -217,5 +304,6 @@ export interface AppStoreState {
   sidebarOpen: boolean;
   settingsOpen: boolean;
   commandPaletteOpen: boolean;
+  packagesOpen: boolean;
   lastEventSeq: number;
 }

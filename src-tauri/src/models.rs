@@ -114,6 +114,89 @@ pub struct PromptImage {
     pub path: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageScope {
+    User,
+    Project,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PiPackageRecord {
+    pub source: String,
+    pub scope: PackageScope,
+    pub installed_path: Option<PathBuf>,
+    pub filtered: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageCatalogQuery {
+    pub name: Option<String>,
+    pub package_type: Option<String>,
+    pub sort: Option<String>,
+    pub page: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageCatalogItem {
+    pub name: String,
+    pub description: String,
+    pub author: String,
+    pub downloads: u64,
+    pub published: String,
+    pub types: Vec<String>,
+    pub npm_url: String,
+    pub repository_url: Option<String>,
+    pub detail_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageCatalogPage {
+    pub items: Vec<PackageCatalogItem>,
+    pub page: usize,
+    pub page_count: usize,
+    pub total: usize,
+    pub from: usize,
+    pub to: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageOperationKind {
+    Install,
+    Remove,
+    Update,
+    UpdateAll,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageOperationRequest {
+    pub kind: PackageOperationKind,
+    pub source: Option<String>,
+    pub scope: Option<PackageScope>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageProgress {
+    pub operation_id: String,
+    pub phase: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageOperationResult {
+    pub packages: Vec<PiPackageRecord>,
+    pub restarted_project_ids: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppEvent {
@@ -157,6 +240,9 @@ pub enum AppEventKind {
     },
     ProtocolWarning {
         message: String,
+    },
+    ExtensionUiExpired {
+        request_id: String,
     },
     #[allow(dead_code)]
     ResyncRequired {

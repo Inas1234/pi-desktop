@@ -1,7 +1,12 @@
 import * as m from "motion/react-m";
-import { useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 
+import { StructuredData } from "@/components/structured-data";
 import type { ToolItem } from "@/lib/types";
+
+const MarkdownBody = lazy(() =>
+  import("@/components/markdown-body").then((module) => ({ default: module.MarkdownBody })),
+);
 
 function arg(record: Record<string, unknown>, ...keys: string[]) {
   for (const key of keys) {
@@ -18,7 +23,16 @@ function summary(tool: ToolItem): string {
   if (tool.name === "grep")
     return [arg(args, "pattern", "query"), arg(args, "path")].filter(Boolean).join(" · ");
   if (tool.name === "find") return arg(args, "pattern", "query", "path");
-  return arg(args, "path", "command", "query") || "Extension tool";
+  const preferred = arg(args, "path", "command", "query", "task", "agent", "url");
+  if (preferred) return preferred;
+  const scalar = Object.entries(args)
+    .filter(([, value]) => ["string", "number", "boolean"].includes(typeof value))
+    .slice(0, 2)
+    .map(([key, value]) => `${key}:${String(value)}`)
+    .join(" · ");
+  if (scalar) return scalar;
+  const collection = Object.entries(args).find(([, value]) => Array.isArray(value));
+  return collection ? `${collection[0]}:${(collection[1] as unknown[]).length}` : "custom tool";
 }
 
 export function ToolCard({ tool }: { tool: ToolItem }) {
@@ -54,9 +68,31 @@ export function ToolCard({ tool }: { tool: ToolItem }) {
       {expanded && (
         <div className="tool-content">
           {tool.output ? (
-            <pre>{tool.output}</pre>
+            tool.status === "running" ? (
+              <pre>{tool.output}</pre>
+            ) : (
+              <div className="tool-markdown message-body">
+                <Suspense fallback={<pre>{tool.output}</pre>}>
+                  <MarkdownBody>{tool.output}</MarkdownBody>
+                </Suspense>
+              </div>
+            )
           ) : (
             <div className="tool-waiting">Waiting for output…</div>
+          )}
+          {typeof tool.args === "object" &&
+            tool.args !== null &&
+            Object.keys(tool.args).length > 0 && (
+              <details className="tool-structured">
+                <summary>Arguments{tool.argsTruncated ? " (truncated)" : ""}</summary>
+                <StructuredData value={tool.args} />
+              </details>
+            )}
+          {tool.details != null && (
+            <details className="tool-structured">
+              <summary>Details{tool.detailsTruncated ? " (truncated)" : ""}</summary>
+              <StructuredData value={tool.details} />
+            </details>
           )}
         </div>
       )}

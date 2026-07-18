@@ -1,16 +1,16 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use base64::Engine;
-use parking_lot::RwLock as ParkingRwLock;
+use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
 use serde_json::{Map, Value, json};
 use tauri::ipc::Channel;
 use tokio::{
@@ -27,17 +27,25 @@ use crate::{
     diagnostics::{command_for, diagnose, resolve_pi},
     error::{AppError, AppResult},
     models::{AppEvent, AppEventKind, PiEnvironmentReport, PromptImage},
-    sessions,
+    projection, sessions,
     windows_job::JobGuard,
 };
 
 const MAX_RPC_RECORD_BYTES: usize = 32 * 1024 * 1024;
 const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_STDERR_LINES: usize = 200;
+const MAX_BLOCKING_DIALOGS: usize = 16;
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+const PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(15);
 
 enum ProcessControl {
     Stop,
+}
+
+struct ProcessWaitState {
+    control: mpsc::Receiver<ProcessControl>,
+    termination: oneshot::Sender<()>,
+    job: Option<JobGuard>,
 }
 
 struct ProjectRuntime {
@@ -45,9 +53,10 @@ struct ProjectRuntime {
     stdin: Mutex<ChildStdin>,
     pending: Mutex<HashMap<String, oneshot::Sender<AppResult<Value>>>>,
     control: mpsc::Sender<ProcessControl>,
+    termination: Mutex<Option<oneshot::Receiver<()>>>,
     settled: AtomicBool,
     has_queue: AtomicBool,
-    blocking_dialogs: AtomicUsize,
+    blocking_dialogs: ParkingMutex<HashSet<String>>,
     last_touched: AtomicU64,
     expected_exit: AtomicBool,
     stderr: Mutex<VecDeque<String>>,
@@ -57,7 +66,7 @@ impl ProjectRuntime {
     fn can_suspend(&self) -> bool {
         self.settled.load(Ordering::Relaxed)
             && !self.has_queue.load(Ordering::Relaxed)
-            && self.blocking_dialogs.load(Ordering::Relaxed) == 0
+            && self.blocking_dialogs.lock().is_empty()
     }
 
     fn touch(&self) {
@@ -109,6 +118,61 @@ impl ProjectManager {
         for id in ids {
             let _ = self.restart_project(&id).await;
         }
+    }
+
+    pub async fn quiesce_for_package_change(
+        self: &Arc<Self>,
+        project_id: Option<&str>,
+    ) -> AppResult<Vec<String>> {
+        let runtimes = self.runtimes.read().await;
+        let targets = runtimes
+            .iter()
+            .filter(|(id, _)| project_id.is_none_or(|target| target == id.as_str()))
+            .map(|(id, runtime)| (id.clone(), runtime.clone()))
+            .collect::<Vec<_>>();
+        let busy = targets
+            .iter()
+            .filter(|(_, runtime)| !runtime.can_suspend())
+            .map(|(id, _)| {
+                self.config
+                    .project(id)
+                    .map_or_else(|| id.clone(), |project| project.name)
+            })
+            .collect::<Vec<_>>();
+        drop(runtimes);
+        if !busy.is_empty() {
+            return Err(AppError::Message(format!(
+                "Wait for these Pi projects to settle before changing packages: {}",
+                busy.join(", ")
+            )));
+        }
+        let ids = targets.into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+        let mut stopped = Vec::new();
+        for id in &ids {
+            if let Err(error) = self.stop_project(id).await {
+                let warnings = self.restore_quiesced_projects(&stopped).await;
+                return Err(AppError::Message(if warnings.is_empty() {
+                    format!("Unable to stop {id} before changing packages: {error}")
+                } else {
+                    format!(
+                        "Unable to stop {id} before changing packages: {error}. {}",
+                        warnings.join(" ")
+                    )
+                }));
+            }
+            stopped.push(id.clone());
+        }
+        Ok(stopped)
+    }
+
+    pub async fn restore_quiesced_projects(self: &Arc<Self>, ids: &[String]) -> Vec<String> {
+        let mut warnings = Vec::new();
+        for id in ids {
+            if let Err(error) = self.start_project(id).await {
+                warnings.push(format!("Unable to restart {id}: {error}"));
+            }
+        }
+        warnings
     }
 
     pub async fn activate_project(self: &Arc<Self>, project_id: &str) -> AppResult<()> {
@@ -169,6 +233,7 @@ impl ProjectManager {
                 "--no-approve"
             })
             .env("PI_SKIP_VERSION_CHECK", "1")
+            .env("PI_TELEMETRY", "0")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -201,6 +266,7 @@ impl ProjectManager {
             .take()
             .ok_or_else(|| AppError::Message("Pi stderr is unavailable".into()))?;
         let (control_tx, control_rx) = mpsc::channel(2);
+        let (termination_tx, termination_rx) = oneshot::channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
         let runtime = Arc::new(ProjectRuntime {
@@ -208,9 +274,10 @@ impl ProjectManager {
             stdin: Mutex::new(stdin),
             pending: Mutex::new(HashMap::new()),
             control: control_tx,
+            termination: Mutex::new(Some(termination_rx)),
             settled: AtomicBool::new(true),
             has_queue: AtomicBool::new(false),
-            blocking_dialogs: AtomicUsize::new(0),
+            blocking_dialogs: ParkingMutex::new(HashSet::new()),
             last_touched: AtomicU64::new(now_millis()),
             expected_exit: AtomicBool::new(false),
             stderr: Mutex::new(VecDeque::with_capacity(MAX_STDERR_LINES)),
@@ -239,8 +306,11 @@ impl ProjectManager {
             runtime.token.clone(),
             runtime.clone(),
             child,
-            control_rx,
-            job,
+            ProcessWaitState {
+                control: control_rx,
+                termination: termination_tx,
+                job,
+            },
         ));
 
         self.emit(
@@ -271,6 +341,7 @@ impl ProjectManager {
     pub async fn stop_project(&self, project_id: &str) -> AppResult<()> {
         let runtime = self.runtimes.write().await.remove(project_id);
         if let Some(runtime) = runtime {
+            let termination = runtime.termination.lock().await.take();
             runtime.expected_exit.store(true, Ordering::Relaxed);
             let _ = runtime.control.send(ProcessControl::Stop).await;
             fail_pending(&runtime, "Pi was stopped").await;
@@ -282,6 +353,14 @@ impl ProjectManager {
                     message: None,
                 },
             );
+            if let Some(termination) = termination
+                && timeout(PROCESS_STOP_TIMEOUT, termination).await.is_err()
+            {
+                return Err(AppError::Message(format!(
+                    "Pi did not stop within {} seconds for project {project_id}",
+                    PROCESS_STOP_TIMEOUT.as_secs()
+                )));
+            }
         }
         Ok(())
     }
@@ -479,7 +558,7 @@ impl ProjectManager {
     ) -> AppResult<()> {
         let mut command = response.as_object().cloned().unwrap_or_default();
         command.insert("type".into(), Value::String("extension_ui_response".into()));
-        command.insert("id".into(), Value::String(request_id));
+        command.insert("id".into(), Value::String(request_id.clone()));
         let runtime = self
             .runtimes
             .read()
@@ -492,12 +571,7 @@ impl ProjectManager {
         let mut stdin = runtime.stdin.lock().await;
         stdin.write_all(&bytes).await?;
         stdin.flush().await?;
-        runtime
-            .blocking_dialogs
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-                Some(count.saturating_sub(1))
-            })
-            .ok();
+        runtime.blocking_dialogs.lock().remove(&request_id);
         Ok(())
     }
 
@@ -528,6 +602,9 @@ impl ProjectManager {
             let mut messages = array_field(messages_response.as_ref(), "messages");
             if messages.len() > 200 {
                 messages = messages.split_off(messages.len() - 200);
+            }
+            for message in &mut messages {
+                projection::project_message(message);
             }
             (messages, None, false)
         };
@@ -684,7 +761,7 @@ async fn stdout_loop(
         if buffer.is_empty() {
             continue;
         }
-        let value = match serde_json::from_slice::<Value>(&buffer) {
+        let mut value = match serde_json::from_slice::<Value>(&buffer) {
             Ok(value) => value,
             Err(error) => {
                 manager.emit(
@@ -705,10 +782,45 @@ async fn stdout_loop(
             let _ = sender.send(Ok(value));
             continue;
         }
+        projection::project_event(&mut value);
         let settled = value.get("type").and_then(Value::as_str) == Some("agent_settled");
+        if let Some(request_id) = overflowing_extension_request(&runtime, &value) {
+            let result = cancel_extension_request(&runtime, &request_id).await;
+            manager.emit(
+                &project_id,
+                None,
+                AppEventKind::ProtocolWarning {
+                    message: match result {
+                        Ok(()) => format!(
+                            "An extension dialog was cancelled because {MAX_BLOCKING_DIALOGS} requests are already queued"
+                        ),
+                        Err(error) => format!(
+                            "Unable to cancel an extension dialog after the queue filled: {error}"
+                        ),
+                    },
+                },
+            );
+            continue;
+        }
         update_runtime_state(&runtime, &value);
+        let request_timeout = extension_request_timeout(&value);
         if events.send(value).is_err() {
             break;
+        }
+        if let Some((request_id, timeout_ms)) = request_timeout {
+            let manager = manager.clone();
+            let project_id = project_id.clone();
+            let runtime = runtime.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
+                if runtime.blocking_dialogs.lock().remove(&request_id) {
+                    manager.emit(
+                        &project_id,
+                        None,
+                        AppEventKind::ExtensionUiExpired { request_id },
+                    );
+                }
+            });
         }
         if settled {
             let manager = manager.clone();
@@ -752,9 +864,13 @@ async fn wait_loop(
     token: String,
     runtime: Arc<ProjectRuntime>,
     mut child: Child,
-    mut control: mpsc::Receiver<ProcessControl>,
-    _job: Option<JobGuard>,
+    wait: ProcessWaitState,
 ) {
+    let ProcessWaitState {
+        mut control,
+        termination,
+        job,
+    } = wait;
     let status = tokio::select! {
         status = child.wait() => status.ok(),
         command = control.recv() => {
@@ -765,6 +881,8 @@ async fn wait_loop(
             child.wait().await.ok()
         }
     };
+    drop(job);
+    let _ = termination.send(());
     manager
         .handle_exit(
             &project_id,
@@ -902,12 +1020,55 @@ fn update_runtime_state(runtime: &ProjectRuntime, value: &Value) {
             if matches!(
                 value.get("method").and_then(Value::as_str),
                 Some("select" | "confirm" | "input" | "editor")
-            ) {
-                runtime.blocking_dialogs.fetch_add(1, Ordering::Relaxed);
+            ) && let Some(id) = value.get("id").and_then(Value::as_str)
+            {
+                runtime.blocking_dialogs.lock().insert(id.to_owned());
             }
         }
         _ => {}
     }
+}
+
+fn overflowing_extension_request(runtime: &ProjectRuntime, value: &Value) -> Option<String> {
+    if value.get("type").and_then(Value::as_str) != Some("extension_ui_request")
+        || !matches!(
+            value.get("method").and_then(Value::as_str),
+            Some("select" | "confirm" | "input" | "editor")
+        )
+    {
+        return None;
+    }
+    let request_id = value.get("id")?.as_str()?;
+    let requests = runtime.blocking_dialogs.lock();
+    (!requests.contains(request_id) && requests.len() >= MAX_BLOCKING_DIALOGS)
+        .then(|| request_id.to_owned())
+}
+
+async fn cancel_extension_request(runtime: &ProjectRuntime, request_id: &str) -> AppResult<()> {
+    let mut response = object("extension_ui_response");
+    response.insert("id".into(), Value::String(request_id.to_owned()));
+    response.insert("cancelled".into(), Value::Bool(true));
+    let mut bytes = serde_json::to_vec(&response)?;
+    bytes.push(b'\n');
+    let mut stdin = runtime.stdin.lock().await;
+    stdin.write_all(&bytes).await?;
+    stdin.flush().await?;
+    Ok(())
+}
+
+fn extension_request_timeout(value: &Value) -> Option<(String, u64)> {
+    if value.get("type").and_then(Value::as_str) != Some("extension_ui_request")
+        || !matches!(
+            value.get("method").and_then(Value::as_str),
+            Some("select" | "confirm" | "input" | "editor")
+        )
+    {
+        return None;
+    }
+    Some((
+        value.get("id")?.as_str()?.to_owned(),
+        value.get("timeout")?.as_u64()?,
+    ))
 }
 
 async fn fail_pending(runtime: &ProjectRuntime, message: &str) {

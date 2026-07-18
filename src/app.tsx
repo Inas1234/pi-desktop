@@ -19,6 +19,11 @@ const SettingsDialog = lazy(() =>
 const CommandPalette = lazy(() =>
   import("@/components/command-palette").then((module) => ({ default: module.CommandPalette })),
 );
+const PackageManagerDialog = lazy(() =>
+  import("@/components/package-manager-dialog").then((module) => ({
+    default: module.PackageManagerDialog,
+  })),
+);
 
 export default function App() {
   const snapshot = useAppStore((value) => value);
@@ -29,6 +34,10 @@ export default function App() {
   useEffect(() => {
     void appStore.initialize();
   }, []);
+
+  useEffect(() => {
+    document.title = runtime?.extensionTitle || "Pi Desktop";
+  }, [runtime?.extensionTitle]);
 
   useEffect(() => {
     function shortcut(event: KeyboardEvent) {
@@ -163,7 +172,10 @@ export default function App() {
                     showReasoning={snapshot.settings.showReasoning}
                   />
                   <Composer project={project} runtime={runtime} />
-                  <ExtensionDialog projectId={project.id} request={runtime.extensionRequest} />
+                  <ExtensionDialog
+                    projectId={project.id}
+                    request={runtime.extensionRequests[0] ?? null}
+                  />
                 </>
               )}
             </main>
@@ -175,19 +187,20 @@ export default function App() {
               <small>Dismiss</small>
             </button>
           )}
-          {project && runtime?.notification && (
+          {project && runtime?.notifications[0] && (
             <button
               type="button"
-              className={`app-toast ${runtime.notification.tone}`}
-              onClick={() => appStore.clearNotification(project.id)}
+              className={`app-toast ${runtime.notifications[0].tone}`}
+              onClick={() => appStore.clearNotification(project.id, runtime.notifications[0]?.id)}
             >
-              <span>{runtime.notification.message}</span>
+              <span>{runtime.notifications[0].message}</span>
               <small>Dismiss</small>
             </button>
           )}
           <Suspense fallback={null}>
             {snapshot.settingsOpen && <SettingsDialog />}
             {snapshot.commandPaletteOpen && <CommandPalette />}
+            {snapshot.packagesOpen && project && <PackageManagerDialog project={project} />}
           </Suspense>
         </div>
       </MotionConfig>

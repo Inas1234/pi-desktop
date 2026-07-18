@@ -1,4 +1,4 @@
-import { Command, PanelLeft, Plus, Settings, Square } from "lucide-react";
+import { Boxes, Command, PanelLeft, Plus, Settings, Square } from "lucide-react";
 import { useMemo, useState } from "react";
 
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -67,6 +67,21 @@ export function CommandPalette() {
               <small>App, project, and providers</small>
             </span>
           </button>
+          {projectId && (
+            <button
+              type="button"
+              onClick={() => {
+                appStore.setPackagesOpen(true);
+                close();
+              }}
+            >
+              <Boxes size={14} />
+              <span>
+                <strong>Pi packages</strong>
+                <small>Install, update, remove, and configure</small>
+              </span>
+            </button>
+          )}
           <button
             type="button"
             onClick={() => {

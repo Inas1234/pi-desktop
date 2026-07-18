@@ -40,6 +40,9 @@ export function Composer({
   const thinking = runtime.state.thinkingLevel ?? "off";
   const pending = runtime.state.pendingMessageCount ?? 0;
   const context = contextPercent(runtime);
+  const widgets = Object.entries(runtime.widgets);
+  const aboveWidgets = widgets.filter(([, widget]) => widget.placement === "aboveEditor");
+  const belowWidgets = widgets.filter(([, widget]) => widget.placement === "belowEditor");
   const commands = useMemo(
     () => (suggestionsDismissed ? [] : matchingSlashCommands(text, runtime.commands)),
     [runtime.commands, suggestionsDismissed, text],
@@ -93,6 +96,7 @@ export function Composer({
     if (command === "new") void appStore.newSession(project.id);
     if (command === "model") setModelOpen(true);
     if (command === "settings" || command === "login") appStore.setSettingsOpen(true);
+    if (command === "packages") appStore.setPackagesOpen(true);
     return true;
   }
 
@@ -115,14 +119,11 @@ export function Composer({
 
   return (
     <div className="composer-wrap">
-      {Object.values(runtime.widgets).flat().length > 0 && (
+      {aboveWidgets.length > 0 && (
         <div className="extension-widget">
-          {Object.values(runtime.widgets)
-            .flat()
-            .map((line, index) => (
-              // biome-ignore lint/suspicious/noArrayIndexKey: Pi widgets provide ordered text lines without stable identifiers.
-              <div key={`${line}-${index}`}>{line}</div>
-            ))}
+          {aboveWidgets.flatMap(([key, widget]) =>
+            widget.lines.map((line) => <div key={`${key}:${line}`}>{line}</div>),
+          )}
         </div>
       )}
       <div className="composer" data-streaming={runtime.isStreaming}>
@@ -261,8 +262,8 @@ export function Composer({
               </span>
             )}
             {pending > 0 && <span className="queue-count">queue:{pending}</span>}
-            {Object.values(runtime.status).map((status) => (
-              <span className="extension-status" key={status}>
+            {Object.entries(runtime.status).map(([key, status]) => (
+              <span className="extension-status" key={key}>
                 {status}
               </span>
             ))}
@@ -294,6 +295,13 @@ export function Composer({
           Enter {runtime.isStreaming ? "steers" : "sends"} · Alt+Enter queues · Shift+Enter newline
         </div>
       </div>
+      {belowWidgets.length > 0 && (
+        <div className="extension-widget extension-widget-below">
+          {belowWidgets.flatMap(([key, widget]) =>
+            widget.lines.map((line) => <div key={`${key}:${line}`}>{line}</div>),
+          )}
+        </div>
+      )}
       {Boolean(runtime.stats.tokens) && (
         <span className="token-total">
           {compactNumber(Number((runtime.stats.tokens as Record<string, unknown>).total ?? 0))}{" "}

@@ -2,6 +2,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { ArrowDown, LoaderCircle, RotateCcw } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
+import { CustomMessage } from "@/components/custom-message";
 import { MessageItem } from "@/components/message-item";
 import { ToolCard } from "@/components/tool-card";
 import { Button } from "@/components/ui/button";
@@ -107,6 +108,7 @@ export function Conversation({
                 <MessageItem message={item} showReasoning={showReasoning} />
               )}
               {item.type === "tool" && <ToolCard tool={item} />}
+              {item.type === "custom" && <CustomMessage message={item} />}
               {item.type === "notice" && <div className={`notice ${item.tone}`}>{item.text}</div>}
             </div>
           );

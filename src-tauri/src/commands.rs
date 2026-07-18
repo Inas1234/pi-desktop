@@ -10,14 +10,18 @@ use crate::{
     error::{AppError, AppResult},
     manager::ProjectManager,
     models::{
-        AppEvent, AppSettings, BootstrapState, PiEnvironmentReport, ProjectRecord, PromptImage,
-        ProviderCredentialStatus, SessionPage, SessionSummary, SettingsPatch,
+        AppEvent, AppSettings, BootstrapState, PackageCatalogPage, PackageCatalogQuery,
+        PackageOperationRequest, PackageOperationResult, PackageProgress, PackageScope,
+        PiEnvironmentReport, PiPackageRecord, ProjectRecord, PromptImage, ProviderCredentialStatus,
+        SessionPage, SessionSummary, SettingsPatch,
     },
+    packages::PiPackageManager,
     sessions,
 };
 
 pub struct AppState {
     pub manager: Arc<ProjectManager>,
+    pub packages: Arc<PiPackageManager>,
 }
 
 #[tauri::command]
@@ -366,6 +370,8 @@ pub fn open_pi_login(state: State<'_, AppState>) -> AppResult<()> {
                 .arg("-d")
                 .arg(&working_directory)
                 .arg(pi)
+                .env("PI_SKIP_VERSION_CHECK", "1")
+                .env("PI_TELEMETRY", "0")
                 .spawn()?;
             return Ok(());
         }
@@ -374,6 +380,8 @@ pub fn open_pi_login(state: State<'_, AppState>) -> AppResult<()> {
             .arg("/K")
             .arg(pi)
             .current_dir(working_directory)
+            .env("PI_SKIP_VERSION_CHECK", "1")
+            .env("PI_TELEMETRY", "0")
             .spawn()?;
         Ok(())
     }
@@ -384,6 +392,63 @@ pub fn open_pi_login(state: State<'_, AppState>) -> AppResult<()> {
             "External login terminal is implemented for Windows in v1".into(),
         ))
     }
+}
+
+#[tauri::command]
+pub async fn list_pi_packages(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> AppResult<Vec<PiPackageRecord>> {
+    state.packages.list(&project_id).await
+}
+
+#[tauri::command]
+pub async fn browse_pi_package_catalog(
+    query: PackageCatalogQuery,
+    state: State<'_, AppState>,
+) -> AppResult<PackageCatalogPage> {
+    state.packages.browse_catalog(query).await
+}
+
+#[tauri::command]
+pub async fn run_pi_package_operation(
+    project_id: String,
+    request: PackageOperationRequest,
+    on_progress: Channel<PackageProgress>,
+    state: State<'_, AppState>,
+) -> AppResult<PackageOperationResult> {
+    state
+        .packages
+        .run_operation(state.manager.clone(), project_id, request, on_progress)
+        .await
+}
+
+#[tauri::command]
+pub async fn cancel_pi_package_operation(
+    operation_id: String,
+    state: State<'_, AppState>,
+) -> AppResult<bool> {
+    Ok(state.packages.cancel(&operation_id).await)
+}
+
+#[tauri::command]
+pub async fn reload_pi_resources(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> AppResult<Vec<String>> {
+    state
+        .packages
+        .reload_resources(state.manager.clone(), &project_id)
+        .await
+}
+
+#[tauri::command]
+pub fn open_pi_package_config(
+    project_id: String,
+    scope: PackageScope,
+    state: State<'_, AppState>,
+) -> AppResult<()> {
+    state.packages.open_config(&project_id, scope)
 }
 
 fn command(command_type: &str) -> Map<String, Value> {

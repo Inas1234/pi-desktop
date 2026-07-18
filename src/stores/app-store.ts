@@ -5,6 +5,7 @@ import type {
   AppEvent,
   AppSettings,
   AppStoreState,
+  CustomItem,
   ExtensionUIRequest,
   MessageItem,
   PiContentBlock,
@@ -45,11 +46,12 @@ export function createRuntime(): ProjectRuntime {
     isStreaming: false,
     isSettled: true,
     currentAssistantId: null,
-    extensionRequest: null,
+    extensionRequests: [],
     composerText: null,
-    notification: null,
+    notifications: [],
     status: {},
     widgets: {},
+    extensionTitle: null,
     warning: null,
   };
 }
@@ -67,6 +69,7 @@ const initialState: AppStoreState = {
   sidebarOpen: true,
   settingsOpen: false,
   commandPaletteOpen: false,
+  packagesOpen: false,
   lastEventSeq: 0,
 };
 
@@ -160,6 +163,42 @@ function boundedTail(value: unknown, limit = 48_000): string {
   return text.length > limit ? `… output truncated …\n${text.slice(-limit)}` : text;
 }
 
+function payloadDetails(value: unknown): {
+  details: unknown | null;
+  detailsTruncated: boolean;
+} {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { details: null, detailsTruncated: false };
+  }
+  const record = value as Record<string, unknown>;
+  return {
+    details: record.details ?? null,
+    detailsTruncated: Boolean(record.detailsTruncated),
+  };
+}
+
+function customItem(message: PiMessage, id: string, complete: boolean): CustomItem | null {
+  if (message.display === false) return null;
+  const label =
+    typeof message.customType === "string"
+      ? message.customType
+      : typeof message.role === "string"
+        ? message.role
+        : "extension";
+  const text =
+    typeof message.summary === "string" ? message.summary : boundedTail(message.content ?? "");
+  return {
+    id,
+    type: "custom",
+    label,
+    text,
+    details: message.details ?? null,
+    detailsTruncated: Boolean(message.detailsTruncated),
+    complete,
+    timestamp: message.timestamp,
+  };
+}
+
 export function normalizeMessages(messages: PiMessage[]): TranscriptItem[] {
   const result: TranscriptItem[] = [];
   messages.forEach((message, index) => {
@@ -184,6 +223,9 @@ export function normalizeMessages(messages: PiMessage[]): TranscriptItem[] {
             output: "",
             status: "running",
             isError: false,
+            details: null,
+            detailsTruncated: false,
+            argsTruncated: Boolean(block.argumentsTruncated),
           });
         }
       }
@@ -200,10 +242,31 @@ export function normalizeMessages(messages: PiMessage[]): TranscriptItem[] {
         output: boundedTail(message.content),
         status: message.isError ? "error" : "success",
         isError: Boolean(message.isError),
+        details: message.details ?? null,
+        detailsTruncated: Boolean(message.detailsTruncated),
+        argsTruncated: false,
       };
       if (existing >= 0) result[existing] = tool;
       else result.push(tool);
+      return;
     }
+    if (message.role === "bashExecution") {
+      result.push({
+        id,
+        type: "tool",
+        name: "bash",
+        args: { command: message.command ?? "" },
+        output: boundedTail(message.output),
+        status: Number(message.exitCode ?? 0) === 0 ? "success" : "error",
+        isError: Number(message.exitCode ?? 0) !== 0,
+        details: null,
+        detailsTruncated: false,
+        argsTruncated: false,
+      });
+      return;
+    }
+    const custom = customItem(message, id, true);
+    if (custom) result.push(custom);
   });
   return result;
 }
@@ -234,7 +297,53 @@ function updateMessage(
   return next;
 }
 
-function applyPiEvent(runtime: ProjectRuntime, value: Record<string, unknown>, seq: number) {
+function updateCustom(
+  messages: TranscriptItem[],
+  id: string,
+  update: (message: CustomItem) => CustomItem,
+): TranscriptItem[] {
+  const index = messages.findIndex((item) => item.type === "custom" && item.id === id);
+  if (index < 0) return messages;
+  const next = [...messages];
+  const item = next[index];
+  if (item.type === "custom") next[index] = update(item);
+  return next;
+}
+
+function eventMessageId(message: PiMessage, seq: number | string): string {
+  return (
+    message.id ??
+    `${String(message.customType ?? message.role ?? "message")}-${String(message.timestamp ?? seq)}`
+  );
+}
+
+function clearExtensionTransient(runtime: ProjectRuntime): ProjectRuntime {
+  return {
+    ...runtime,
+    extensionRequests: [],
+    notifications: [],
+    status: {},
+    widgets: {},
+    extensionTitle: null,
+  };
+}
+
+function boundedRecord<T>(
+  source: Record<string, T>,
+  key: string,
+  value: T | null,
+  limit: number,
+): Record<string, T> {
+  const entries = Object.entries(source).filter(([entryKey]) => entryKey !== key);
+  if (value !== null) entries.push([key, value]);
+  return Object.fromEntries(entries.slice(-limit)) as Record<string, T>;
+}
+
+function applyPiEvent(
+  runtime: ProjectRuntime,
+  value: Record<string, unknown>,
+  seq: number | string,
+): ProjectRuntime {
   const eventType = typeof value.type === "string" ? value.type : "unknown";
   if (eventType === "agent_start") {
     return { ...runtime, isStreaming: true, isSettled: false };
@@ -258,8 +367,15 @@ function applyPiEvent(runtime: ProjectRuntime, value: Record<string, unknown>, s
   }
   if (eventType === "message_start") {
     const message = value.message as PiMessage | undefined;
-    if (!message || (message.role !== "user" && message.role !== "assistant")) return runtime;
-    const id = message.id ?? `${message.role}-${seq}`;
+    if (!message) return runtime;
+    const id = eventMessageId(message, seq);
+    if (message.role === "toolResult" || message.role === "bashExecution") return runtime;
+    if (message.role !== "user" && message.role !== "assistant") {
+      const item = customItem(message, id, false);
+      return item
+        ? { ...runtime, messages: [...runtime.messages.filter((entry) => entry.id !== id), item] }
+        : runtime;
+    }
     const item: MessageItem = {
       id,
       type: "message",
@@ -293,7 +409,41 @@ function applyPiEvent(runtime: ProjectRuntime, value: Record<string, unknown>, s
   }
   if (eventType === "message_end") {
     const message = value.message as PiMessage | undefined;
-    if (message?.role !== "assistant") return runtime;
+    if (!message) return runtime;
+    if (message.role === "user") {
+      const id = eventMessageId(message, seq);
+      const existing = runtime.messages.some(
+        (entry) => entry.type === "message" && entry.id === id,
+      );
+      const item: MessageItem = {
+        id,
+        type: "message",
+        role: "user",
+        text: messageText(message),
+        reasoning: "",
+        complete: true,
+        timestamp: message.timestamp,
+      };
+      return {
+        ...runtime,
+        messages: existing
+          ? updateMessage(runtime.messages, id, () => item)
+          : [...runtime.messages, item],
+      };
+    }
+    if (message.role === "toolResult" || message.role === "bashExecution") return runtime;
+    if (message.role !== "assistant") {
+      const id = eventMessageId(message, seq);
+      const item = customItem(message, id, true);
+      if (!item) return runtime;
+      const exists = runtime.messages.some((entry) => entry.id === id);
+      return {
+        ...runtime,
+        messages: exists
+          ? updateCustom(runtime.messages, id, () => item)
+          : [...runtime.messages, item],
+      };
+    }
     const id = runtime.currentAssistantId ?? message.id;
     if (!id) return runtime;
     return {
@@ -319,11 +469,15 @@ function applyPiEvent(runtime: ProjectRuntime, value: Record<string, unknown>, s
         output: "",
         status: "running",
         isError: false,
+        details: null,
+        detailsTruncated: false,
+        argsTruncated: Boolean(value.argsTruncated),
       })),
     };
   }
   if (eventType === "tool_execution_update") {
     const id = String(value.toolCallId ?? `tool-${seq}`);
+    const projected = payloadDetails(value.partialResult);
     return {
       ...runtime,
       messages: upsertTool(runtime.messages, id, (tool) => ({
@@ -334,12 +488,16 @@ function applyPiEvent(runtime: ProjectRuntime, value: Record<string, unknown>, s
         output: boundedTail(value.partialResult),
         status: "running",
         isError: false,
+        details: projected.details,
+        detailsTruncated: projected.detailsTruncated,
+        argsTruncated: Boolean(value.argsTruncated ?? tool?.argsTruncated),
       })),
     };
   }
   if (eventType === "tool_execution_end") {
     const id = String(value.toolCallId ?? `tool-${seq}`);
     const isError = Boolean(value.isError);
+    const projected = payloadDetails(value.result);
     return {
       ...runtime,
       messages: upsertTool(runtime.messages, id, (tool) => ({
@@ -350,6 +508,9 @@ function applyPiEvent(runtime: ProjectRuntime, value: Record<string, unknown>, s
         output: boundedTail(value.result),
         status: isError ? "error" : "success",
         isError,
+        details: projected.details ?? tool?.details ?? null,
+        detailsTruncated: projected.detailsTruncated || Boolean(tool?.detailsTruncated),
+        argsTruncated: Boolean(value.argsTruncated ?? tool?.argsTruncated),
       })),
     };
   }
@@ -365,37 +526,76 @@ function applyPiEvent(runtime: ProjectRuntime, value: Record<string, unknown>, s
   if (eventType === "extension_ui_request") {
     const request = value as unknown as ExtensionUIRequest;
     if (request.method === "notify") {
+      const tone = ["info", "warning", "error"].includes(String(request.notifyType))
+        ? (request.notifyType as "info" | "warning" | "error")
+        : "info";
       return {
         ...runtime,
-        notification: {
-          message: String(request.message ?? ""),
-          tone: String(request.notifyType ?? "info"),
-        },
+        notifications: [
+          ...runtime.notifications,
+          {
+            id: request.id,
+            message: String(request.message ?? ""),
+            tone,
+          },
+        ].slice(-10),
       };
     }
     if (request.method === "setStatus") {
       const key = String(request.statusKey ?? "extension");
-      const next = { ...runtime.status };
       const text = request.statusText;
-      if (typeof text === "string" && text) next[key] = text;
-      else delete next[key];
-      return { ...runtime, status: next };
+      return {
+        ...runtime,
+        status: boundedRecord(
+          runtime.status,
+          key,
+          typeof text === "string" && text ? text : null,
+          32,
+        ),
+      };
     }
     if (request.method === "setWidget") {
       const key = String(request.widgetKey ?? "extension");
-      const next = { ...runtime.widgets };
-      if (Array.isArray(request.widgetLines)) next[key] = request.widgetLines.map(String);
-      else delete next[key];
-      return { ...runtime, widgets: next };
+      const widget = Array.isArray(request.widgetLines)
+        ? {
+            lines: request.widgetLines.map(String),
+            placement:
+              request.widgetPlacement === "belowEditor"
+                ? ("belowEditor" as const)
+                : ("aboveEditor" as const),
+          }
+        : null;
+      return { ...runtime, widgets: boundedRecord(runtime.widgets, key, widget, 16) };
     }
     if (request.method === "setTitle") {
-      if (typeof request.title === "string") document.title = request.title;
-      return runtime;
+      return {
+        ...runtime,
+        extensionTitle: typeof request.title === "string" && request.title ? request.title : null,
+      };
     }
     if (request.method === "set_editor_text") {
       return { ...runtime, composerText: String(request.text ?? "") };
     }
-    return { ...runtime, extensionRequest: request };
+    if (runtime.extensionRequests.some((entry) => entry.id === request.id)) return runtime;
+    return { ...runtime, extensionRequests: [...runtime.extensionRequests, request].slice(-16) };
+  }
+  if (eventType === "extension_error") {
+    const extension = String(value.extensionPath ?? "Pi extension")
+      .split(/[\\/]/)
+      .pop();
+    const text = boundedTail(value.error, 4000) || "Extension failed";
+    return {
+      ...runtime,
+      messages: [
+        ...runtime.messages,
+        {
+          id: `extension-error-${seq}`,
+          type: "notice",
+          tone: "error",
+          text: `${extension}: ${text}`,
+        },
+      ],
+    };
   }
   if (eventType.includes("compaction")) {
     return { ...runtime, state: { ...runtime.state, isCompacting: eventType.endsWith("start") } };
@@ -414,7 +614,7 @@ export function reduceEvent(source: AppStoreState, event: AppEvent): AppStoreSta
   }
   return updateRuntime(next, event.projectId, (runtime) => {
     if (event.type === "connection") {
-      const connection =
+      const connection: ProjectRuntime["connection"] =
         event.state === "connecting"
           ? "starting"
           : event.state === "connected"
@@ -422,7 +622,10 @@ export function reduceEvent(source: AppStoreState, event: AppEvent): AppStoreSta
             : event.state === "error"
               ? "error"
               : "stopped";
-      return { ...runtime, connection, connectionMessage: event.message ?? null };
+      const updated = { ...runtime, connection, connectionMessage: event.message ?? null };
+      return connection === "starting" || connection === "stopped"
+        ? clearExtensionTransient(updated)
+        : updated;
     }
     if (event.type === "snapshot") {
       return {
@@ -444,12 +647,12 @@ export function reduceEvent(source: AppStoreState, event: AppEvent): AppStoreSta
     if (event.type === "pi_event") return applyPiEvent(runtime, event.event, event.seq);
     if (event.type === "pi_events") {
       return event.events.reduce(
-        (current, value) => applyPiEvent(current, value, event.seq),
+        (current, value, index) => applyPiEvent(current, value, `${event.seq}:${index}`),
         runtime,
       );
     }
     if (event.type === "process_exited") {
-      return {
+      return clearExtensionTransient({
         ...runtime,
         connection: event.expected ? "stopped" : "error",
         connectionMessage: event.expected
@@ -457,12 +660,19 @@ export function reduceEvent(source: AppStoreState, event: AppEvent): AppStoreSta
           : `Pi exited${event.code == null ? "" : ` with code ${event.code}`}`,
         isStreaming: false,
         isSettled: true,
+      });
+    }
+    if (event.type === "extension_ui_expired") {
+      return {
+        ...runtime,
+        extensionRequests: runtime.extensionRequests.filter(
+          (request) => request.id !== event.requestId,
+        ),
       };
     }
-    return {
-      ...runtime,
-      warning: event.type === "protocol_warning" ? event.message : event.reason,
-    };
+    if (event.type === "protocol_warning") return { ...runtime, warning: event.message };
+    if (event.type === "resync_required") return { ...runtime, warning: event.reason };
+    return runtime;
   });
 }
 
@@ -645,7 +855,12 @@ export const appStore = {
   },
   async respondToExtension(projectId: string, requestId: string, response: unknown) {
     await withError(() => desktop.respondExtensionUI(projectId, requestId, response));
-    publish(updateRuntime(state, projectId, (runtime) => ({ ...runtime, extensionRequest: null })));
+    publish(
+      updateRuntime(state, projectId, (runtime) => ({
+        ...runtime,
+        extensionRequests: runtime.extensionRequests.filter((request) => request.id !== requestId),
+      })),
+    );
   },
   consumeComposerText(projectId: string) {
     publish(updateRuntime(state, projectId, (runtime) => ({ ...runtime, composerText: null })));
@@ -658,6 +873,9 @@ export const appStore = {
   },
   setCommandPaletteOpen(open: boolean) {
     patch({ commandPaletteOpen: open });
+  },
+  setPackagesOpen(open: boolean) {
+    patch({ packagesOpen: open });
   },
   async toggleSidebar() {
     const sidebarOpen = !state.sidebarOpen;
@@ -697,8 +915,15 @@ export const appStore = {
   clearError() {
     patch({ error: null });
   },
-  clearNotification(projectId: string) {
-    publish(updateRuntime(state, projectId, (runtime) => ({ ...runtime, notification: null })));
+  clearNotification(projectId: string, notificationId?: string) {
+    publish(
+      updateRuntime(state, projectId, (runtime) => ({
+        ...runtime,
+        notifications: notificationId
+          ? runtime.notifications.filter((notification) => notification.id !== notificationId)
+          : runtime.notifications.slice(1),
+      })),
+    );
   },
   _replaceForTest(next: AppStoreState) {
     publish(next);

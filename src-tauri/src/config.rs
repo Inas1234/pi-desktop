@@ -33,6 +33,14 @@ impl ConfigStore {
         })
     }
 
+    #[cfg(test)]
+    pub fn for_test(path: PathBuf, config: AppConfig) -> Self {
+        Self {
+            path,
+            config: RwLock::new(config),
+        }
+    }
+
     pub fn snapshot(&self) -> AppConfig {
         self.config.read().clone()
     }

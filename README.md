@@ -28,8 +28,9 @@ There is no embedded Node backend and no second conversation database.
 
 - Stream assistant text and reasoning into the conversation.
 - Render completed messages as safe Markdown with raw HTML disabled.
-- Display specialized tool cards for Bash, read, write, edit, grep, find, and list operations.
-- Accumulate bounded tool-output tails without flooding the frontend.
+- Display adaptive tool cards with summaries, streaming text, safe completed Markdown, structured
+  trees, and compact object tables for built-in and extension tools.
+- Accumulate bounded tool-output tails and structured details without flooding the frontend.
 - Show queue state, context usage, active model, thinking level, and connection state.
 - Send prompts, steer an active run, queue a follow-up, attach images, or abort work.
 - Recover once from an unexpected Pi process exit and request a frontend resync when needed.
@@ -37,11 +38,27 @@ There is no embedded Node backend and no second conversation database.
 ### Commands and Pi extensions
 
 - Type `/` in the composer to open slash-command autocomplete.
-- Use desktop commands: `/new`, `/model`, `/settings`, and `/login`.
+- Use desktop commands: `/new`, `/model`, `/settings`, `/login`, and `/packages`.
 - Merge Pi extension commands, prompt templates, and skill commands into the same autocomplete.
 - Navigate suggestions with Up/Down, complete with Tab or Enter, and dismiss with Escape.
-- Support Pi extension UI requests for select, confirm, input, editor, notifications, status,
-  widgets, titles, and editor-text updates.
+- Support queued Pi extension UI requests for select, confirm, input, editor, notifications,
+  status, above/below-composer widgets, titles, and editor-text updates.
+- Render displayable extension custom messages and bounded extension failures live and after session
+  reloads.
+
+### Pi packages
+
+- Open package management from Settings, the command palette, or `/packages`.
+- List installed user and project packages, including filtered entries and installed paths.
+- Install npm, Git/SSH/HTTPS, and local-path packages through Pi at user or trusted-project scope.
+- Remove or update one package, manually update all packages, cancel long operations, and inspect
+  bounded progress output.
+- Browse the paged official [Pi package catalog](https://pi.dev/packages) in the app, search and
+  filter its live results on demand, and install a catalog entry through Pi in one step.
+- Launch native `pi config` in a visible terminal for advanced resource filtering, then explicitly
+  reload affected Pi processes.
+- Quiesce only settled runtimes during mutations and restore exactly the previously running set,
+  including after failure or cancellation. No package checks or updates run in the background.
 
 ### Models, credentials, and settings
 
@@ -65,8 +82,8 @@ There is no embedded Node backend and no second conversation database.
 
 ## Deliberately out of scope for v1
 
-Pi Desktop does not currently include an embedded editor, terminal, file explorer, package manager,
-changes panel, session-tree navigator, fork/clone UI, export workflow, or automatic Pi installer.
+Pi Desktop does not currently include an embedded editor, terminal, file explorer, changes panel,
+session-tree navigator, fork/clone UI, export workflow, or automatic Pi installer.
 Those features should not be added at the expense of the chat-first workflow or idle resource use.
 
 ## Technology
@@ -119,6 +136,9 @@ Once the window opens:
 3. Read the trust explanation and open the project as trusted or restricted.
 4. Select a model if Pi does not already have one configured.
 5. Start chatting or type `/` to open command autocomplete.
+
+Installed packages remain owned by Pi. Package actions require an explicit arbitrary-code
+confirmation, and project-scope actions are unavailable for restricted projects.
 
 Running `pnpm dev` by itself only starts the browser frontend. That preview can display setup states,
 but it cannot spawn or communicate with Pi because those capabilities live in Tauri/Rust.
@@ -185,6 +205,7 @@ Rust ProjectManager
   |-- session offset index and transcript paging
   |-- Windows Credential Manager
   |-- Windows Job Object cleanup
+  |-- serialized Pi package commands and bounded progress
   |
   |  stdin/stdout JSONL RPC
   v
@@ -214,6 +235,8 @@ src/
 src-tauri/
   src/commands.rs          Public Tauri command handlers
   src/manager.rs           Pi processes, RPC, batching, recovery, idle reaper
+  src/packages.rs          Pi-owned package listing, mutation, cancellation, and restart handling
+  src/projection.rs        Bounded generic tool, custom-message, and extension projections
   src/sessions.rs          Session discovery, indexing, and paging
   src/config.rs            Atomic non-secret application configuration
   src/credentials.rs       Windows Credential Manager integration
@@ -231,10 +254,26 @@ state, Pi path, and idle timeout.
 Project trust controls whether Pi may load project-local settings, extensions, prompts, skills, and
 packages. It does **not** add a second tool-approval layer or change Pi's execution semantics.
 
+Pi Desktop never edits Pi package settings itself. It invokes the configured Pi executable with
+direct arguments, an explicit trust flag, the selected project as the working directory, and
+non-interactive Git credentials. Package sources and installed paths continue to live in Pi's user
+or project settings.
+
 Simple API keys are stored as generic credentials under the `Pi Desktop` service in Windows
 Credential Manager and injected into child-process environment variables. Pi Desktop never writes
 or replaces `~/.pi/agent/auth.json`. If Pi already has credentials for a provider, Pi's own
 credential source takes precedence.
+
+## Extension compatibility
+
+Pi Desktop supports extension tools, commands, providers, skills, prompts, displayable custom
+messages, and the standardized RPC extension UI protocol. Unknown structured tool data is rendered
+generically within explicit depth, collection, string, and byte limits.
+
+Pi's terminal-only themes, shortcuts, custom headers, footers, editors, `ctx.ui.custom()`
+components, and extension-provided message or entry renderer functions cannot be reproduced in RPC
+mode because Pi does not transmit a declarative renderer for them. Those features remain available
+in Pi's terminal UI.
 
 ## Performance goals
 

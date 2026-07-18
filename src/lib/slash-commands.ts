@@ -21,6 +21,11 @@ export const DESKTOP_SLASH_COMMANDS: readonly PiCommand[] = [
     description: "Configure provider credentials",
     source: "desktop",
   },
+  {
+    name: "packages",
+    description: "Install and manage Pi packages",
+    source: "desktop",
+  },
 ];
 
 export function matchingSlashCommands(

@@ -1,5 +1,5 @@
 import { open } from "@tauri-apps/plugin-dialog";
-import { Check, ExternalLink, KeyRound, ShieldCheck, ShieldOff, Trash2 } from "lucide-react";
+import { Boxes, Check, ExternalLink, KeyRound, ShieldCheck, ShieldOff, Trash2 } from "lucide-react";
 import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
@@ -151,6 +151,21 @@ export function SettingsDialog() {
                 >
                   {project.trusted ? <ShieldCheck size={14} /> : <ShieldOff size={14} />}
                   {project.trusted ? "Trusted" : "Restricted"}
+                </Button>
+              </div>
+              <div className="setting-row">
+                <span>
+                  <strong>Pi packages</strong>
+                  <small>Manage user and project extensions through Pi.</small>
+                </span>
+                <Button
+                  size="sm"
+                  onClick={() => {
+                    appStore.setSettingsOpen(false);
+                    appStore.setPackagesOpen(true);
+                  }}
+                >
+                  <Boxes size={14} /> Manage packages
                 </Button>
               </div>
               <Button
