@@ -1,0 +1,61 @@
+[package]
+name = "pi-desktop"
+version = "0.1.0"
+description = "A minimal desktop client for the Pi coding agent"
+authors = ["Pi Desktop contributors"]
+edition = "2024"
+rust-version = "1.88"
+
+[lib]
+name = "pi_desktop_lib"
+# V1 is desktop-only. Mobile library artifacts are unnecessary and make the
+# MinGW debug linker try to export more symbols than a Windows DLL can hold.
+crate-type = ["rlib"]
+
+[[bin]]
+name = "pi-desktop"
+path = "src/main.rs"
+required-features = ["desktop"]
+
+[features]
+default = ["desktop"]
+desktop = [
+  "tauri/wry",
+  "dep:tauri-plugin-dialog",
+  "dep:tauri-plugin-opener",
+  "dep:tauri-plugin-window-state",
+]
+
+[build-dependencies]
+tauri-build = { version = "2.5", features = [] }
+
+[dependencies]
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+directories = "6"
+keyring = { version = "4.1", default-features = false, features = ["v1", "windows-native-keyring-store"] }
+mime_guess = "2"
+parking_lot = "0.12"
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2.11", default-features = false, features = ["test"] }
+tauri-plugin-dialog = { version = "2.7", optional = true }
+tauri-plugin-opener = { version = "2.5", optional = true }
+tauri-plugin-window-state = { version = "2.4", optional = true }
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+trash = "5"
+uuid = { version = "1", features = ["serde", "v4"] }
+which = "8"
+zeroize = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_System_JobObjects",
+  "Win32_System_Threading"
+] }

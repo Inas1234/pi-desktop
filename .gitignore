@@ -1,0 +1,10 @@
+node_modules/
+dist/
+target/
+src-tauri/target/
+.vite/
+coverage/
+*.log
+.idea/
+.vscode/
+*.local
