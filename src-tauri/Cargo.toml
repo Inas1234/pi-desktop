@@ -2,7 +2,10 @@
 name = "pi-desktop"
 version = "0.1.0"
 description = "A minimal desktop client for the Pi coding agent"
-authors = ["Pi Desktop contributors"]
+authors = ["Inas1234"]
+license = "MIT"
+repository = "https://github.com/Inas1234/pi-desktop"
+homepage = "https://github.com/Inas1234/pi-desktop"
 edition = "2024"
 rust-version = "1.88"
 

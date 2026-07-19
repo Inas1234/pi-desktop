@@ -43,6 +43,7 @@ export interface BootstrapState {
   environment: PiEnvironmentReport;
   providers: ProviderCredentialStatus[];
   dismissedNotificationKeys: string[];
+  startupWarning: string | null;
 }
 
 export interface SessionSummary {

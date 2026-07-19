@@ -13,6 +13,8 @@ import type { ProjectRecord, ProjectRuntime, ThinkingLevel } from "@/lib/types";
 import { compactNumber, fileName } from "@/lib/utils";
 import { appStore } from "@/stores/app-store";
 
+const MAX_IMAGES_PER_PROMPT = 8;
+
 const levels: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 const ModelPicker = lazy(() =>
   import("@/components/model-picker").then((module) => ({ default: module.ModelPicker })),
@@ -80,9 +82,19 @@ export function Composer({
       title: "Attach images",
       filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "gif", "webp"] }],
     });
-    if (Array.isArray(selected)) setImages((current) => [...new Set([...current, ...selected])]);
-    else if (typeof selected === "string")
-      setImages((current) => [...new Set([...current, selected])]);
+    const paths = Array.isArray(selected)
+      ? selected
+      : typeof selected === "string"
+        ? [selected]
+        : [];
+    if (!paths.length) return;
+    setImages((current) => {
+      const combined = [...new Set([...current, ...paths])];
+      if (combined.length > MAX_IMAGES_PER_PROMPT) {
+        appStore.showError(`Attach no more than ${MAX_IMAGES_PER_PROMPT} images at once.`);
+      }
+      return combined.slice(0, MAX_IMAGES_PER_PROMPT);
+    });
   }
 
   function completeCommand(command = commands[activeCommand]) {

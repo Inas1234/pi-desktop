@@ -35,7 +35,7 @@ pub fn run() {
         .with_target(false)
         .try_init();
 
-    let config = Arc::new(ConfigStore::load().expect("unable to load Pi Desktop configuration"));
+    let config = Arc::new(ConfigStore::load());
     let credentials = Arc::new(CredentialStore);
     let packages = PiPackageManager::new(config.clone());
     let manager = ProjectManager::new(config, credentials);

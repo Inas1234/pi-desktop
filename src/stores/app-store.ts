@@ -818,6 +818,7 @@ export const appStore = {
         ...state,
         bootstrapped: true,
         loading: false,
+        error: bootstrap.startupWarning,
         settings: bootstrap.settings,
         projects: bootstrap.projects,
         activeProjectId,

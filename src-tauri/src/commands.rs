@@ -37,6 +37,7 @@ pub async fn initialize(
         environment: state.manager.diagnose_pi(),
         providers: state.manager.credentials.list_statuses(),
         dismissed_notification_keys: config.dismissed_notification_keys,
+        startup_warning: state.manager.config.startup_warning(),
     })
 }
 

@@ -2,6 +2,7 @@ use std::{fs, path::PathBuf};
 
 use directories::ProjectDirs;
 use parking_lot::RwLock;
+use uuid::Uuid;
 
 use crate::{
     error::{AppError, AppResult},
@@ -14,18 +15,52 @@ const MAX_NOTIFICATION_KEY_BYTES: usize = 96;
 pub struct ConfigStore {
     path: PathBuf,
     config: RwLock<AppConfig>,
+    startup_warning: Option<String>,
 }
 
 impl ConfigStore {
-    pub fn load() -> AppResult<Self> {
-        let dirs = ProjectDirs::from("dev", "pi", "Pi Desktop").ok_or_else(|| {
-            AppError::Message("Unable to resolve the app config directory".into())
-        })?;
-        let dir = dirs.config_dir();
-        fs::create_dir_all(dir)?;
-        let path = dir.join("config.json");
+    pub fn load() -> Self {
+        let path = std::env::var_os("PI_DESKTOP_CONFIG_DIR")
+            .map(PathBuf::from)
+            .map(|directory| directory.join("config.json"))
+            .or_else(|| {
+                ProjectDirs::from("dev", "pi", "Pi Desktop")
+                    .map(|dirs| dirs.config_dir().join("config.json"))
+            })
+            .unwrap_or_else(|| std::env::temp_dir().join("Pi Desktop").join("config.json"));
+        match Self::load_at(path.clone()) {
+            Ok(store) => store,
+            Err(error) => Self {
+                path,
+                config: RwLock::new(AppConfig::default()),
+                startup_warning: Some(format!(
+                    "Pi Desktop could not load its settings ({error}). Defaults are active, but changes may not persist."
+                )),
+            },
+        }
+    }
+
+    fn load_at(path: PathBuf) -> AppResult<Self> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| AppError::Message("Invalid config path".into()))?;
+        fs::create_dir_all(parent)?;
+        let mut startup_warning = None;
         let mut config = if path.exists() {
-            serde_json::from_slice(&fs::read(&path)?)?
+            let bytes = fs::read(&path)?;
+            match serde_json::from_slice(&bytes) {
+                Ok(config) => config,
+                Err(error) => {
+                    let backup = path
+                        .with_file_name(format!("config.invalid-{}.json", Uuid::new_v4().simple()));
+                    fs::rename(&path, &backup)?;
+                    startup_warning = Some(format!(
+                        "Pi Desktop recovered from invalid settings ({error}). The original file was preserved at {}.",
+                        backup.display()
+                    ));
+                    AppConfig::default()
+                }
+            }
         } else {
             AppConfig::default()
         };
@@ -43,6 +78,7 @@ impl ConfigStore {
         Ok(Self {
             path,
             config: RwLock::new(config),
+            startup_warning,
         })
     }
 
@@ -51,7 +87,12 @@ impl ConfigStore {
         Self {
             path,
             config: RwLock::new(config),
+            startup_warning: None,
         }
+    }
+
+    pub fn startup_warning(&self) -> Option<String> {
+        self.startup_warning.clone()
     }
 
     pub fn snapshot(&self) -> AppConfig {
@@ -73,8 +114,10 @@ impl ConfigStore {
 
     pub fn mutate<T>(&self, update: impl FnOnce(&mut AppConfig) -> AppResult<T>) -> AppResult<T> {
         let mut guard = self.config.write();
-        let result = update(&mut guard)?;
-        self.persist(&guard)?;
+        let mut next = guard.clone();
+        let result = update(&mut next)?;
+        self.persist(&next)?;
+        *guard = next;
         Ok(result)
     }
 
@@ -178,5 +221,50 @@ mod tests {
     fn older_configs_default_to_no_dismissed_notifications() {
         let config: AppConfig = serde_json::from_str(r#"{"projects": []}"#).unwrap();
         assert!(config.dismissed_notification_keys.is_empty());
+    }
+
+    #[test]
+    fn recovers_from_invalid_config_and_preserves_the_original() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        fs::write(&path, b"{invalid json").unwrap();
+
+        let store = ConfigStore::load_at(path.clone()).unwrap();
+
+        assert!(store.snapshot().projects.is_empty());
+        assert!(store.startup_warning().is_some());
+        assert!(!path.exists());
+        let backups = fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("config.invalid-")
+            })
+            .count();
+        assert_eq!(backups, 1);
+    }
+
+    #[test]
+    fn does_not_commit_in_memory_changes_when_persistence_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::for_test(
+            directory.path().join("missing").join("config.json"),
+            AppConfig::default(),
+        );
+
+        let result = store.update_settings(SettingsPatch {
+            theme: Some("light".into()),
+            idle_timeout_minutes: None,
+            sidebar_collapsed: None,
+            pi_path: None,
+            active_project_id: None,
+            show_reasoning: None,
+        });
+
+        assert!(result.is_err());
+        assert_eq!(store.settings().theme, "system");
     }
 }

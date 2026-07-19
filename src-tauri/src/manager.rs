@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    io::Read as StdRead,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -14,7 +15,7 @@ use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
 use serde_json::{Map, Value, json};
 use tauri::ipc::Channel;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncReadExt, AsyncWriteExt},
     process::{Child, ChildStdin, Command},
     sync::{Mutex, RwLock, mpsc, oneshot},
     time::{MissedTickBehavior, interval, timeout},
@@ -33,8 +34,11 @@ use crate::{
 
 const MAX_RPC_RECORD_BYTES: usize = 32 * 1024 * 1024;
 const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+const MAX_IMAGES_PER_PROMPT: usize = 8;
 const MAX_STDERR_LINES: usize = 200;
+const MAX_STDERR_LINE_BYTES: usize = 64 * 1024;
 const MAX_BLOCKING_DIALOGS: usize = 16;
+const EVENT_CHANNEL_CAPACITY: usize = 256;
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -45,7 +49,7 @@ enum ProcessControl {
 struct ProcessWaitState {
     control: mpsc::Receiver<ProcessControl>,
     termination: oneshot::Sender<()>,
-    job: Option<JobGuard>,
+    job: JobGuard,
 }
 
 struct ProjectRuntime {
@@ -253,7 +257,16 @@ impl ProjectManager {
         let process_id = child
             .id()
             .ok_or_else(|| AppError::Message("Pi did not expose a process id".into()))?;
-        let job = JobGuard::attach(process_id).ok();
+        let job = match JobGuard::attach(process_id) {
+            Ok(job) => job,
+            Err(error) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(AppError::Message(format!(
+                    "Unable to secure the Pi process tree: {error}"
+                )));
+            }
+        };
         let stdin = child
             .stdin
             .take()
@@ -268,7 +281,7 @@ impl ProjectManager {
             .ok_or_else(|| AppError::Message("Pi stderr is unavailable".into()))?;
         let (control_tx, control_rx) = mpsc::channel(2);
         let (termination_tx, termination_rx) = oneshot::channel();
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
 
         let runtime = Arc::new(ProjectRuntime {
             token: Uuid::new_v4().to_string(),
@@ -426,11 +439,10 @@ impl ProjectManager {
         runtime.touch();
         let id = Uuid::new_v4().to_string();
         command.insert("id".into(), Value::String(id.clone()));
-        let (sender, receiver) = oneshot::channel();
-        runtime.pending.lock().await.insert(id, sender);
-
         let mut bytes = serde_json::to_vec(&command)?;
         bytes.push(b'\n');
+        let (sender, receiver) = oneshot::channel();
+        runtime.pending.lock().await.insert(id.clone(), sender);
         if let Err(error) = async {
             let mut stdin = runtime.stdin.lock().await;
             stdin.write_all(&bytes).await?;
@@ -438,13 +450,11 @@ impl ProjectManager {
         }
         .await
         {
+            runtime.pending.lock().await.remove(&id);
             return Err(AppError::Io(error));
         }
 
-        let response = timeout(RPC_TIMEOUT, receiver)
-            .await
-            .map_err(|_| AppError::Timeout)?
-            .map_err(|_| AppError::Message("Pi response channel closed".into()))??;
+        let response = wait_for_rpc_response(&runtime.pending, &id, receiver, RPC_TIMEOUT).await?;
         if response.get("success").and_then(Value::as_bool) == Some(false) {
             return Err(AppError::Message(
                 response
@@ -466,6 +476,11 @@ impl ProjectManager {
     ) -> AppResult<()> {
         if text.trim().is_empty() && images.is_empty() {
             return Err(AppError::Message("A message or image is required".into()));
+        }
+        if images.len() > MAX_IMAGES_PER_PROMPT {
+            return Err(AppError::Message(format!(
+                "Attach no more than {MAX_IMAGES_PER_PROMPT} images at once"
+            )));
         }
         let mut command = Map::new();
         command.insert("type".into(), Value::String(command_type.to_owned()));
@@ -741,18 +756,77 @@ fn restart_after_crash(
     })
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum FramedLine {
+    Line(Vec<u8>),
+    Oversized,
+}
+
+struct BoundedLfFramer {
+    limit: usize,
+    record: Vec<u8>,
+    oversized: bool,
+}
+
+impl BoundedLfFramer {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            record: Vec::with_capacity(limit.min(8 * 1024)),
+            oversized: false,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> Vec<FramedLine> {
+        let mut frames = Vec::new();
+        for byte in chunk {
+            if *byte == b'\n' {
+                if let Some(frame) = self.complete() {
+                    frames.push(frame);
+                }
+            } else if !self.oversized {
+                if self.record.len() >= self.limit {
+                    self.record.clear();
+                    self.oversized = true;
+                } else {
+                    self.record.push(*byte);
+                }
+            }
+        }
+        frames
+    }
+
+    fn finish(&mut self) -> Option<FramedLine> {
+        self.complete()
+    }
+
+    fn complete(&mut self) -> Option<FramedLine> {
+        if self.oversized {
+            self.oversized = false;
+            self.record.clear();
+            return Some(FramedLine::Oversized);
+        }
+        if self.record.last() == Some(&b'\r') {
+            self.record.pop();
+        }
+        if self.record.is_empty() {
+            return None;
+        }
+        Some(FramedLine::Line(std::mem::take(&mut self.record)))
+    }
+}
+
 async fn stdout_loop(
     manager: Arc<ProjectManager>,
     project_id: String,
     runtime: Arc<ProjectRuntime>,
-    stdout: tokio::process::ChildStdout,
-    events: mpsc::UnboundedSender<Value>,
+    mut stdout: tokio::process::ChildStdout,
+    events: mpsc::Sender<Value>,
 ) {
-    let mut reader = BufReader::new(stdout);
-    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 8 * 1024];
+    let mut framer = BoundedLfFramer::new(MAX_RPC_RECORD_BYTES);
     loop {
-        buffer.clear();
-        let count = match reader.read_until(b'\n', &mut buffer).await {
+        let count = match stdout.read(&mut chunk).await {
             Ok(count) => count,
             Err(error) => {
                 manager.emit(
@@ -768,123 +842,143 @@ async fn stdout_loop(
         if count == 0 {
             break;
         }
-        if buffer.len() > MAX_RPC_RECORD_BYTES {
+        for frame in framer.push(&chunk[..count]) {
+            if !process_stdout_frame(&manager, &project_id, &runtime, &events, frame).await {
+                return;
+            }
+        }
+    }
+    if let Some(frame) = framer.finish() {
+        let _ = process_stdout_frame(&manager, &project_id, &runtime, &events, frame).await;
+    }
+}
+
+async fn process_stdout_frame(
+    manager: &Arc<ProjectManager>,
+    project_id: &str,
+    runtime: &Arc<ProjectRuntime>,
+    events: &mpsc::Sender<Value>,
+    frame: FramedLine,
+) -> bool {
+    let FramedLine::Line(buffer) = frame else {
+        manager.emit(
+            project_id,
+            None,
+            AppEventKind::ProtocolWarning {
+                message: "Pi emitted an oversized protocol record".into(),
+            },
+        );
+        return true;
+    };
+    let mut value = match serde_json::from_slice::<Value>(&buffer) {
+        Ok(value) => value,
+        Err(error) => {
             manager.emit(
-                &project_id,
+                project_id,
                 None,
                 AppEventKind::ProtocolWarning {
-                    message: "Pi emitted an oversized protocol record".into(),
+                    message: format!("Pi emitted invalid JSON: {error}"),
                 },
             );
-            continue;
+            return true;
         }
-        if buffer.ends_with(b"\n") {
-            buffer.pop();
-        }
-        if buffer.ends_with(b"\r") {
-            buffer.pop();
-        }
-        if buffer.is_empty() {
-            continue;
-        }
-        let mut value = match serde_json::from_slice::<Value>(&buffer) {
-            Ok(value) => value,
-            Err(error) => {
+    };
+
+    if value.get("type").and_then(Value::as_str) == Some("response")
+        && let Some(id) = value.get("id").and_then(Value::as_str)
+        && let Some(sender) = runtime.pending.lock().await.remove(id)
+    {
+        let _ = sender.send(Ok(value));
+        return true;
+    }
+    if value.get("type").and_then(Value::as_str) == Some("command_catalog_changed") {
+        *runtime.command_catalog.lock() = None;
+    }
+    projection::project_event(&mut value);
+    let settled = value.get("type").and_then(Value::as_str) == Some("agent_settled");
+    if let Some(request_id) = overflowing_extension_request(runtime, &value) {
+        let result = cancel_extension_request(runtime, &request_id).await;
+        manager.emit(
+            project_id,
+            None,
+            AppEventKind::ProtocolWarning {
+                message: match result {
+                    Ok(()) => format!(
+                        "An extension dialog was cancelled because {MAX_BLOCKING_DIALOGS} requests are already queued"
+                    ),
+                    Err(error) => format!(
+                        "Unable to cancel an extension dialog after the queue filled: {error}"
+                    ),
+                },
+            },
+        );
+        return true;
+    }
+    update_runtime_state(runtime, &value);
+    let request_timeout = extension_request_timeout(&value);
+    if events.send(value).await.is_err() {
+        return false;
+    }
+    if let Some((request_id, timeout_ms)) = request_timeout {
+        let manager = manager.clone();
+        let project_id = project_id.to_owned();
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
+            if runtime.blocking_dialogs.lock().remove(&request_id) {
+                manager.emit(
+                    &project_id,
+                    None,
+                    AppEventKind::ExtensionUiExpired { request_id },
+                );
+            }
+        });
+    }
+    if settled {
+        let manager = manager.clone();
+        let project_id = project_id.to_owned();
+        tokio::spawn(async move {
+            if let Err(error) = manager.bootstrap_project(&project_id).await {
                 manager.emit(
                     &project_id,
                     None,
                     AppEventKind::ProtocolWarning {
-                        message: format!("Pi emitted invalid JSON: {error}"),
+                        message: format!("Unable to refresh the settled session: {error}"),
                     },
                 );
-                continue;
             }
-        };
+        });
+    }
+    true
+}
 
-        if value.get("type").and_then(Value::as_str) == Some("response")
-            && let Some(id) = value.get("id").and_then(Value::as_str)
-            && let Some(sender) = runtime.pending.lock().await.remove(id)
-        {
-            let _ = sender.send(Ok(value));
-            continue;
+async fn stderr_loop(runtime: Arc<ProjectRuntime>, mut stderr: tokio::process::ChildStderr) {
+    let mut chunk = [0_u8; 8 * 1024];
+    let mut framer = BoundedLfFramer::new(MAX_STDERR_LINE_BYTES);
+    loop {
+        let count = match stderr.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(count) => count,
+        };
+        for frame in framer.push(&chunk[..count]) {
+            store_stderr_frame(&runtime, frame).await;
         }
-        if value.get("type").and_then(Value::as_str) == Some("command_catalog_changed") {
-            *runtime.command_catalog.lock() = None;
-        }
-        projection::project_event(&mut value);
-        let settled = value.get("type").and_then(Value::as_str) == Some("agent_settled");
-        if let Some(request_id) = overflowing_extension_request(&runtime, &value) {
-            let result = cancel_extension_request(&runtime, &request_id).await;
-            manager.emit(
-                &project_id,
-                None,
-                AppEventKind::ProtocolWarning {
-                    message: match result {
-                        Ok(()) => format!(
-                            "An extension dialog was cancelled because {MAX_BLOCKING_DIALOGS} requests are already queued"
-                        ),
-                        Err(error) => format!(
-                            "Unable to cancel an extension dialog after the queue filled: {error}"
-                        ),
-                    },
-                },
-            );
-            continue;
-        }
-        update_runtime_state(&runtime, &value);
-        let request_timeout = extension_request_timeout(&value);
-        if events.send(value).is_err() {
-            break;
-        }
-        if let Some((request_id, timeout_ms)) = request_timeout {
-            let manager = manager.clone();
-            let project_id = project_id.clone();
-            let runtime = runtime.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
-                if runtime.blocking_dialogs.lock().remove(&request_id) {
-                    manager.emit(
-                        &project_id,
-                        None,
-                        AppEventKind::ExtensionUiExpired { request_id },
-                    );
-                }
-            });
-        }
-        if settled {
-            let manager = manager.clone();
-            let project_id = project_id.clone();
-            tokio::spawn(async move {
-                if let Err(error) = manager.bootstrap_project(&project_id).await {
-                    manager.emit(
-                        &project_id,
-                        None,
-                        AppEventKind::ProtocolWarning {
-                            message: format!("Unable to refresh the settled session: {error}"),
-                        },
-                    );
-                }
-            });
-        }
+    }
+    if let Some(frame) = framer.finish() {
+        store_stderr_frame(&runtime, frame).await;
     }
 }
 
-async fn stderr_loop(runtime: Arc<ProjectRuntime>, stderr: tokio::process::ChildStderr) {
-    let mut reader = BufReader::new(stderr);
-    let mut buffer = String::new();
-    loop {
-        buffer.clear();
-        match reader.read_line(&mut buffer).await {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {
-                let mut lines = runtime.stderr.lock().await;
-                if lines.len() >= MAX_STDERR_LINES {
-                    lines.pop_front();
-                }
-                lines.push_back(buffer.trim_end().to_owned());
-            }
-        }
+async fn store_stderr_frame(runtime: &ProjectRuntime, frame: FramedLine) {
+    let line = match frame {
+        FramedLine::Line(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        FramedLine::Oversized => "[oversized stderr line discarded]".into(),
+    };
+    let mut lines = runtime.stderr.lock().await;
+    if lines.len() >= MAX_STDERR_LINES {
+        lines.pop_front();
     }
+    lines.push_back(line);
 }
 
 async fn wait_loop(
@@ -925,7 +1019,7 @@ async fn wait_loop(
 async fn event_batch_loop(
     manager: Arc<ProjectManager>,
     project_id: String,
-    mut receiver: mpsc::UnboundedReceiver<Value>,
+    mut receiver: mpsc::Receiver<Value>,
 ) {
     let mut ticker = interval(Duration::from_millis(33));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1106,6 +1200,25 @@ async fn fail_pending(runtime: &ProjectRuntime, message: &str) {
     }
 }
 
+async fn wait_for_rpc_response(
+    pending: &Mutex<HashMap<String, oneshot::Sender<AppResult<Value>>>>,
+    id: &str,
+    receiver: oneshot::Receiver<AppResult<Value>>,
+    wait: Duration,
+) -> AppResult<Value> {
+    match timeout(wait, receiver).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(_)) => {
+            pending.lock().await.remove(id);
+            Err(AppError::Message("Pi response channel closed".into()))
+        }
+        Err(_) => {
+            pending.lock().await.remove(id);
+            Err(AppError::Timeout)
+        }
+    }
+}
+
 fn object(command_type: &str) -> Map<String, Value> {
     let mut object = Map::new();
     object.insert("type".into(), Value::String(command_type.to_owned()));
@@ -1129,7 +1242,8 @@ fn is_unknown_command(error: &AppError, command: &str) -> bool {
 }
 
 fn encode_image(path: &Path) -> AppResult<Value> {
-    let metadata = std::fs::metadata(path)?;
+    let mut file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
     if metadata.len() > MAX_IMAGE_BYTES {
         return Err(AppError::Message("Images must be 20 MB or smaller".into()));
     }
@@ -1137,7 +1251,13 @@ fn encode_image(path: &Path) -> AppResult<Value> {
         .first_raw()
         .filter(|mime| mime.starts_with("image/"))
         .ok_or_else(|| AppError::Message("Only image attachments are supported".into()))?;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(std::fs::read(path)?);
+    let mut bytes = Vec::with_capacity(metadata.len().try_into().unwrap_or(0));
+    let mut limited = StdRead::take(&mut file, MAX_IMAGE_BYTES + 1);
+    StdRead::read_to_end(&mut limited, &mut bytes)?;
+    if bytes.len() as u64 > MAX_IMAGE_BYTES {
+        return Err(AppError::Message("Images must be 20 MB or smaller".into()));
+    }
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
     Ok(json!({ "type": "image", "data": encoded, "mimeType": mime }))
 }
 
@@ -1152,11 +1272,22 @@ fn now_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashMap, sync::Arc, time::Duration};
+
     use serde_json::json;
+    use tokio::sync::{Mutex, oneshot};
 
-    use crate::error::AppError;
+    use crate::{
+        config::ConfigStore,
+        credentials::CredentialStore,
+        error::AppError,
+        models::{AppConfig, AppSettings, ProjectRecord},
+    };
 
-    use super::{is_high_frequency, is_unknown_command, merge_event};
+    use super::{
+        BoundedLfFramer, FramedLine, ProjectManager, is_high_frequency, is_unknown_command,
+        merge_event, object, wait_for_rpc_response,
+    };
 
     #[test]
     fn combines_adjacent_text_deltas() {
@@ -1182,6 +1313,115 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_slice(b"{\"text\":\"a\xE2\x80\xA8b\"}").unwrap();
         assert_eq!(value["text"], "a\u{2028}b");
+    }
+
+    #[test]
+    fn frames_fragmented_utf8_and_lf_or_crlf_records() {
+        let mut framer = BoundedLfFramer::new(128);
+        assert!(framer.push(b"{\"text\":\"a\xE2").is_empty());
+        let frames = framer.push(b"\x80\xA8b\"}\r\n{\"ok\":true}\n");
+        assert_eq!(frames.len(), 2);
+        let FramedLine::Line(first) = &frames[0] else {
+            panic!("expected a record");
+        };
+        let first: serde_json::Value = serde_json::from_slice(first).unwrap();
+        assert_eq!(first["text"], "a\u{2028}b");
+        let FramedLine::Line(second) = &frames[1] else {
+            panic!("expected a record");
+        };
+        let second: serde_json::Value = serde_json::from_slice(second).unwrap();
+        assert_eq!(second["ok"], true);
+    }
+
+    #[test]
+    fn discards_oversized_records_and_resumes_at_the_next_lf() {
+        let mut framer = BoundedLfFramer::new(4);
+        assert_eq!(
+            framer.push(b"12345\nok\n"),
+            vec![FramedLine::Oversized, FramedLine::Line(b"ok".to_vec())]
+        );
+        assert!(framer.finish().is_none());
+    }
+
+    #[tokio::test]
+    async fn removes_pending_rpc_entries_after_timeout() {
+        let pending = Mutex::new(HashMap::new());
+        let (sender, receiver) = oneshot::channel();
+        pending.lock().await.insert("request".into(), sender);
+
+        let result =
+            wait_for_rpc_response(&pending, "request", receiver, Duration::from_millis(1)).await;
+
+        assert!(matches!(result, Err(AppError::Timeout)));
+        assert!(pending.lock().await.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn correlates_fake_pi_responses_and_stops_the_process_tree() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("fake-pi.ps1");
+        let executable = directory.path().join("fake-pi.cmd");
+        std::fs::write(
+            &script,
+            r#"$ErrorActionPreference = 'Stop'
+while (($line = [Console]::In.ReadLine()) -ne $null) {
+  if ([string]::IsNullOrWhiteSpace($line)) { continue }
+  $request = $line | ConvertFrom-Json
+  $response = [ordered]@{
+    type = 'response'
+    id = $request.id
+    success = $true
+    data = @{
+      command = $request.type
+      models = @()
+      commands = @()
+      messages = @()
+    }
+  }
+  [Console]::Out.WriteLine(($response | ConvertTo-Json -Compress -Depth 8))
+  [Console]::Out.Flush()
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &executable,
+            "@echo off\r\npowershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%~dp0fake-pi.ps1\" %*\r\n",
+        )
+        .unwrap();
+        let project = ProjectRecord {
+            id: "project".into(),
+            name: "Fake".into(),
+            path: directory.path().to_path_buf(),
+            trusted: false,
+            active_session: None,
+            created_at: String::new(),
+            last_opened_at: String::new(),
+        };
+        let config = Arc::new(ConfigStore::for_test(
+            directory.path().join("config.json"),
+            AppConfig {
+                settings: AppSettings {
+                    pi_path: Some(executable),
+                    ..AppSettings::default()
+                },
+                projects: vec![project],
+                ..AppConfig::default()
+            },
+        ));
+        let manager = ProjectManager::new(config, Arc::new(CredentialStore));
+
+        manager.start_project("project").await.unwrap();
+        let (first, second) = tokio::join!(
+            manager.rpc("project", object("first")),
+            manager.rpc("project", object("second"))
+        );
+
+        assert_eq!(first.unwrap().pointer("/data/command").unwrap(), "first");
+        assert_eq!(second.unwrap().pointer("/data/command").unwrap(), "second");
+        manager.stop_project("project").await.unwrap();
+        assert!(!manager.is_running("project").await);
     }
 
     #[test]

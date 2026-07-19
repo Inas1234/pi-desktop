@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs::{self, File},
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -18,7 +18,54 @@ use crate::{
 };
 
 const MAX_SESSION_LINE_BYTES: usize = 32 * 1024 * 1024;
-static SESSION_INDEXES: OnceLock<RwLock<HashMap<PathBuf, Arc<SessionIndex>>>> = OnceLock::new();
+const MAX_CACHED_SESSION_INDEXES: usize = 32;
+static SESSION_INDEXES: OnceLock<RwLock<SessionIndexCache>> = OnceLock::new();
+
+#[derive(Default)]
+struct SessionIndexCache {
+    entries: HashMap<PathBuf, Arc<SessionIndex>>,
+    order: VecDeque<PathBuf>,
+}
+
+impl SessionIndexCache {
+    fn get(
+        &mut self,
+        path: &Path,
+        modified: Option<SystemTime>,
+        file_size: u64,
+    ) -> Option<Arc<SessionIndex>> {
+        let index = self
+            .entries
+            .get(path)
+            .filter(|index| index.modified == modified && index.file_size == file_size)
+            .cloned();
+        if index.is_some() {
+            self.order.retain(|entry| entry != path);
+            self.order.push_back(path.to_path_buf());
+        } else if self.entries.contains_key(path) {
+            self.remove(path);
+        }
+        index
+    }
+
+    fn insert(&mut self, path: PathBuf, index: Arc<SessionIndex>) {
+        self.remove(&path);
+        while self.entries.len() >= MAX_CACHED_SESSION_INDEXES {
+            let Some(oldest) = self.order.pop_front() else {
+                self.entries.clear();
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+        self.order.push_back(path.clone());
+        self.entries.insert(path, index);
+    }
+
+    fn remove(&mut self, path: &Path) {
+        self.entries.remove(path);
+        self.order.retain(|entry| entry != path);
+    }
+}
 
 #[derive(Debug)]
 struct IndexedEntry {
@@ -161,12 +208,9 @@ fn session_index(path: &Path) -> AppResult<Arc<SessionIndex>> {
     let metadata = fs::metadata(path)?;
     let modified = metadata.modified().ok();
     let file_size = metadata.len();
-    let indexes = SESSION_INDEXES.get_or_init(|| RwLock::new(HashMap::new()));
-    if let Some(index) = indexes.read().get(path)
-        && index.modified == modified
-        && index.file_size == file_size
-    {
-        return Ok(index.clone());
+    let indexes = SESSION_INDEXES.get_or_init(|| RwLock::new(SessionIndexCache::default()));
+    if let Some(index) = indexes.write().get(path, modified, file_size) {
+        return Ok(index);
     }
 
     let index = Arc::new(build_index(path, modified, file_size)?);
@@ -179,6 +223,15 @@ fn build_index(
     modified: Option<SystemTime>,
     file_size: u64,
 ) -> AppResult<SessionIndex> {
+    build_index_with_limit(path, modified, file_size, MAX_SESSION_LINE_BYTES)
+}
+
+fn build_index_with_limit(
+    path: &Path,
+    modified: Option<SystemTime>,
+    file_size: u64,
+    max_line_bytes: usize,
+) -> AppResult<SessionIndex> {
     let mut reader = BufReader::new(File::open(path)?);
     let mut bytes = Vec::new();
     let mut entries = Vec::new();
@@ -187,11 +240,12 @@ fn build_index(
     loop {
         let offset = reader.stream_position()?;
         bytes.clear();
-        let length = reader.read_until(b'\n', &mut bytes)?;
+        let mut limited = Read::take(&mut reader, (max_line_bytes + 1) as u64);
+        let length = limited.read_until(b'\n', &mut bytes)?;
         if length == 0 {
             break;
         }
-        if length > MAX_SESSION_LINE_BYTES {
+        if length > max_line_bytes {
             return Err(AppError::Message(
                 "Session contains an oversized record".into(),
             ));
@@ -499,13 +553,48 @@ fn same_path(left: &Path, right: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Write, path::Path};
+    use std::{
+        io::Write,
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
 
     use tempfile::NamedTempFile;
 
     use super::{
+        MAX_CACHED_SESSION_INDEXES, SessionIndex, SessionIndexCache, build_index_with_limit,
         encode_project_path, load_message_page, read_summary, resolve_project_session_dir,
     };
+
+    #[test]
+    fn session_index_cache_evicts_the_oldest_entry() {
+        let mut cache = SessionIndexCache::default();
+        for index in 0..=MAX_CACHED_SESSION_INDEXES {
+            cache.insert(
+                PathBuf::from(format!("session-{index}.jsonl")),
+                Arc::new(SessionIndex {
+                    modified: None,
+                    file_size: index as u64,
+                    entries: Vec::new(),
+                    active_messages: Vec::new(),
+                }),
+            );
+        }
+
+        assert_eq!(cache.entries.len(), MAX_CACHED_SESSION_INDEXES);
+        assert!(!cache.entries.contains_key(Path::new("session-0.jsonl")));
+        assert!(cache.entries.contains_key(Path::new(&format!(
+            "session-{MAX_CACHED_SESSION_INDEXES}.jsonl"
+        ))));
+    }
+
+    #[test]
+    fn rejects_oversized_session_records_before_reading_the_remainder() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "{}", "x".repeat(32)).unwrap();
+        let result = build_index_with_limit(file.path(), None, 32, 16);
+        assert!(result.is_err());
+    }
 
     #[test]
     fn matches_pi_project_path_encoding_for_windows_verbatim_paths() {

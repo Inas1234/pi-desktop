@@ -5,6 +5,7 @@ src-tauri/target/
 .vite/
 coverage/
 *.log
+*.tsbuildinfo
 .idea/
 .vscode/
 *.local
