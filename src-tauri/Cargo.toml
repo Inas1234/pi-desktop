@@ -41,7 +41,7 @@ reqwest = { version = "0.13", default-features = false, features = ["charset", "
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tauri = { version = "2.11", default-features = false, features = ["test"] }
+tauri = { version = "2.11", default-features = false, features = [] }
 tauri-plugin-dialog = { version = "2.7", optional = true }
 tauri-plugin-opener = { version = "2.5", optional = true }
 tauri-plugin-window-state = { version = "2.4", optional = true }
@@ -61,3 +61,13 @@ windows-sys = { version = "0.61", features = [
   "Win32_System_JobObjects",
   "Win32_System_Threading"
 ] }
+
+# Release builds favor the smallest distributable binary. These settings keep
+# runtime functionality intact while trading additional link time and unwind
+# metadata for a substantially smaller executable.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
