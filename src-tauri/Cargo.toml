@@ -36,7 +36,7 @@ tauri-build = { version = "2.5", features = [] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 directories = "6"
-dom_query = "0.27"
+dom_query = "0.28"
 keyring = { version = "4.1", default-features = false, features = ["v1", "windows-native-keyring-store"] }
 mime_guess = "2"
 parking_lot = "0.12"
