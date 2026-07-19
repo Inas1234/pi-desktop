@@ -2,6 +2,12 @@
   "name": "pi-desktop",
   "private": true,
   "version": "0.1.0",
+  "license": "MIT",
+  "author": "Inas1234",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Inas1234/pi-desktop.git"
+  },
   "packageManager": "pnpm@10.10.0",
   "pnpm": {
     "onlyBuiltDependencies": [
@@ -20,8 +26,10 @@
     "rust:check": "cargo check --manifest-path src-tauri/Cargo.toml",
     "rust:test": "cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --lib",
     "rust:lint": "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings",
+    "release:check": "node scripts/check-release.mjs",
+    "release:smoke": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release-smoke.ps1",
     "tauri": "tauri",
-    "check": "pnpm lint && pnpm typecheck && pnpm test && pnpm build && pnpm rust:check && pnpm rust:test && pnpm rust:lint"
+    "check": "pnpm release:check && pnpm lint && pnpm typecheck && pnpm test && pnpm build && pnpm rust:check && pnpm rust:test && pnpm rust:lint"
   },
   "dependencies": {
     "@radix-ui/react-collapsible": "1.1.16",

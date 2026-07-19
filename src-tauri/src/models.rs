@@ -89,6 +89,7 @@ pub struct BootstrapState {
     pub environment: PiEnvironmentReport,
     pub providers: Vec<ProviderCredentialStatus>,
     pub dismissed_notification_keys: Vec<String>,
+    pub startup_warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

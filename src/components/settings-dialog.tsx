@@ -1,5 +1,14 @@
 import { open } from "@tauri-apps/plugin-dialog";
-import { Boxes, Check, ExternalLink, KeyRound, ShieldCheck, ShieldOff, Trash2 } from "lucide-react";
+import {
+  Boxes,
+  Check,
+  Copy,
+  ExternalLink,
+  KeyRound,
+  ShieldCheck,
+  ShieldOff,
+  Trash2,
+} from "lucide-react";
 import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
@@ -24,6 +33,7 @@ export function SettingsDialog() {
   );
   const [providerId, setProviderId] = useState<string | null>(null);
   const [secret, setSecret] = useState("");
+  const [diagnosticsCopied, setDiagnosticsCopied] = useState(false);
 
   async function choosePi() {
     const selected = await open({
@@ -266,6 +276,33 @@ export function SettingsDialog() {
                   )}
                 </div>
               ))}
+            </div>
+          </section>
+
+          <section className="settings-section">
+            <h3>About</h3>
+            <div className="setting-row">
+              <span>
+                <strong>Pi Desktop {__APP_VERSION__}</strong>
+                <small>Windows x64 · Pi 0.80.x protocol</small>
+              </span>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => {
+                  const diagnostics = [
+                    `Pi Desktop ${__APP_VERSION__}`,
+                    `Pi ${environment?.version ?? "not found"}`,
+                    `Runtime status: ${environment?.status ?? "unknown"}`,
+                    `Compatible: ${environment?.compatible ? "yes" : "no"}`,
+                  ].join("\n");
+                  void navigator.clipboard.writeText(diagnostics);
+                  setDiagnosticsCopied(true);
+                }}
+              >
+                {diagnosticsCopied ? <Check size={13} /> : <Copy size={13} />}
+                {diagnosticsCopied ? "Copied" : "Copy diagnostics"}
+              </Button>
             </div>
           </section>
         </div>

@@ -41,6 +41,7 @@ const previewBootstrap: BootstrapState = {
   },
   providers: [],
   dismissedNotificationKeys: [],
+  startupWarning: null,
 };
 
 async function call<T>(command: string, args?: Record<string, unknown>): Promise<T> {

@@ -8,8 +8,8 @@ Pi still owns model access, tools, extensions, provider integrations, queues, an
 files. The desktop app owns process lifecycle, protocol transport, credentials, and presentation.
 There is no embedded Node backend and no second conversation database.
 
-> Pi Desktop is currently an early v1 implementation. The core desktop workflow works, but the
-> project is still under active development and has not reached a stable public release.
+> Pi Desktop 0.1.0 is a preview release. The core desktop workflow is usable, but the Windows
+> installer is not yet Authenticode-signed and may trigger an unknown-publisher warning.
 
 ## What works today
 
@@ -147,6 +147,14 @@ confirmation, and project-scope actions are unavailable for restricted projects.
 Running `pnpm dev` by itself only starts the browser frontend. That preview can display setup states,
 but it cannot spawn or communicate with Pi because those capabilities live in Tauri/Rust.
 
+## Downloading a release
+
+Versioned installers and SHA-256 checksums are published on the
+[GitHub Releases page](https://github.com/Inas1234/pi-desktop/releases).
+For the unsigned 0.1.0 preview, compare the downloaded installer against `SHA256SUMS.txt` before
+running it. Windows SmartScreen may display an unknown-publisher warning until the project has a
+trusted Authenticode signing identity.
+
 ## Keyboard shortcuts
 
 | Shortcut | Action |
@@ -177,6 +185,8 @@ Use pnpm for all JavaScript and Tauri scripts. Do not create npm or Yarn lockfil
 | `pnpm rust:check` | Check the Rust desktop crate |
 | `pnpm rust:test` | Run Rust library tests without the WebView desktop feature |
 | `pnpm rust:lint` | Run Clippy with warnings denied |
+| `pnpm release:check` | Verify synchronized release versions, identifiers, license, and changelog |
+| `pnpm release:smoke` | Measure packaged shell startup, idle CPU, and private working set |
 | `pnpm check` | Run the complete frontend and Rust verification suite |
 
 `pnpm rust:test` disables the desktop feature so protocol and session tests do not initialize
@@ -195,6 +205,10 @@ The installer is written below:
 ```text
 src-tauri/target/release/bundle/nsis/
 ```
+
+Release publication is intentionally manual. Push an existing version tag, then run the `Release`
+GitHub Actions workflow with that tag. The workflow repeats the complete check suite, builds the
+NSIS installer, creates `SHA256SUMS.txt`, and publishes the GitHub release.
 
 ## Architecture
 
@@ -326,3 +340,4 @@ cannot access Tauri commands.
 
 Read [AGENTS.md](./AGENTS.md) before changing the project. It documents the architectural ownership
 boundaries, performance constraints, coding conventions, and expected verification for changes.
+Pi Desktop is available under the [MIT License](./LICENSE).

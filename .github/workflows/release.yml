@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to package
+        required: true
+        default: v0.1.0
+        type: string
+      prerelease:
+        description: Publish as a GitHub prerelease
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          targets: x86_64-pc-windows-msvc
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: Verify tag matches application version
+        shell: pwsh
+        run: |
+          $version = (Get-Content -Raw package.json | ConvertFrom-Json).version
+          if ("v$version" -ne "${{ inputs.tag }}") {
+            throw "Tag ${{ inputs.tag }} does not match application version $version."
+          }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+      - run: pnpm tauri build
+      - name: Prepare release assets
+        id: assets
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem "src-tauri/target/release/bundle/nsis/*.exe" -File -ErrorAction Stop | Select-Object -First 1
+          $hash = Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256
+          $checksum = Join-Path $installer.DirectoryName "SHA256SUMS.txt"
+          "$($hash.Hash.ToLowerInvariant())  $($installer.Name)" | Set-Content -LiteralPath $checksum -Encoding ascii
+          $signature = (Get-AuthenticodeSignature -LiteralPath $installer.FullName).Status
+          "installer=$($installer.FullName)" >> $env:GITHUB_OUTPUT
+          "checksum=$checksum" >> $env:GITHUB_OUTPUT
+          "signature=$signature" >> $env:GITHUB_OUTPUT
+      - name: Require the preview signing status to be explicit
+        shell: pwsh
+        run: |
+          if ("${{ steps.assets.outputs.signature }}" -ne "NotSigned") {
+            throw "Release notes and workflow must be updated when Authenticode signing is enabled."
+          }
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          INSTALLER: ${{ steps.assets.outputs.installer }}
+          CHECKSUM: ${{ steps.assets.outputs.checksum }}
+        run: |
+          $arguments = @(
+            "release", "create", $env:RELEASE_TAG,
+            $env:INSTALLER, $env:CHECKSUM,
+            "--verify-tag",
+            "--title", "Pi Desktop $env:RELEASE_TAG",
+            "--notes-file", "RELEASE_NOTES.md"
+          )
+          if ($env:PRERELEASE -eq "true") {
+            $arguments += "--prerelease"
+          }
+          & gh @arguments

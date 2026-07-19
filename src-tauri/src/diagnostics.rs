@@ -53,9 +53,7 @@ pub fn diagnose(override_path: Option<PathBuf>) -> PiEnvironmentReport {
         .unwrap_or(raw.as_str())
         .trim_start_matches('v');
     let parsed = Version::parse(version_text).ok();
-    let compatible = parsed
-        .as_ref()
-        .is_some_and(|version| version.major > 0 || version.minor >= 80);
+    let compatible = output.status.success() && parsed.as_ref().is_some_and(is_compatible_version);
 
     PiEnvironmentReport {
         status: if output.status.success() {
@@ -68,12 +66,18 @@ pub fn diagnose(override_path: Option<PathBuf>) -> PiEnvironmentReport {
         version: (!raw.is_empty()).then_some(raw),
         compatible,
         node_path,
-        message: if compatible {
+        message: if !output.status.success() {
+            "Pi was found, but its version check failed.".into()
+        } else if compatible {
             "Pi is ready.".into()
         } else {
-            "Pi 0.80.0 or newer is required.".into()
+            "Pi Desktop 0.1 requires Pi 0.80.x.".into()
         },
     }
+}
+
+fn is_compatible_version(version: &Version) -> bool {
+    version.major == 0 && version.minor == 80
 }
 
 pub fn command_for(path: &PathBuf) -> Command {
@@ -85,4 +89,20 @@ pub fn command_for(path: &PathBuf) -> Command {
         command.creation_flags(CREATE_NO_WINDOW);
     }
     command
+}
+
+#[cfg(test)]
+mod tests {
+    use semver::Version;
+
+    use super::is_compatible_version;
+
+    #[test]
+    fn accepts_only_the_validated_pi_protocol_series() {
+        assert!(is_compatible_version(&Version::parse("0.80.0").unwrap()));
+        assert!(is_compatible_version(&Version::parse("0.80.10").unwrap()));
+        assert!(!is_compatible_version(&Version::parse("0.79.9").unwrap()));
+        assert!(!is_compatible_version(&Version::parse("0.81.0").unwrap()));
+        assert!(!is_compatible_version(&Version::parse("1.0.0").unwrap()));
+    }
 }
