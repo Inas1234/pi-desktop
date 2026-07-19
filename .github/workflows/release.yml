@@ -52,6 +52,12 @@ jobs:
         shell: pwsh
         run: |
           $installer = Get-ChildItem "src-tauri/target/release/bundle/nsis/*.exe" -File -ErrorAction Stop | Select-Object -First 1
+          $assetName = $installer.Name.Replace(" ", ".")
+          if ($assetName -ne $installer.Name) {
+            $assetPath = Join-Path $installer.DirectoryName $assetName
+            Move-Item -LiteralPath $installer.FullName -Destination $assetPath
+            $installer = Get-Item -LiteralPath $assetPath
+          }
           $hash = Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256
           $checksum = Join-Path $installer.DirectoryName "SHA256SUMS.txt"
           "$($hash.Hash.ToLowerInvariant())  $($installer.Name)" | Set-Content -LiteralPath $checksum -Encoding ascii
