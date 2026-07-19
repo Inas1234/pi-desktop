@@ -1,5 +1,10 @@
 import type { AppEvent, AppStoreState } from "@/lib/types";
-import { createRuntime, normalizeMessages, reduceEvent } from "@/stores/app-store";
+import {
+  createRuntime,
+  dismissNotificationInState,
+  normalizeMessages,
+  reduceEvent,
+} from "@/stores/app-store";
 
 function emptyState(): AppStoreState {
   return {
@@ -18,6 +23,7 @@ function emptyState(): AppStoreState {
     activeProjectId: "project",
     environment: null,
     providers: [],
+    dismissedNotificationKeys: [],
     runtimes: { project: createRuntime() },
     sidebarOpen: true,
     settingsOpen: false,
@@ -288,6 +294,66 @@ describe("Pi event reducer", () => {
     expect(current.runtimes.project.extensionRequests.map((request) => request.id)).toEqual([
       "second",
     ]);
+  });
+
+  it("suppresses dismissed notifications across projects and repeated events", () => {
+    let current = reduceEvent(emptyState(), {
+      seq: 1,
+      projectId: "project",
+      type: "pi_event",
+      event: {
+        type: "extension_ui_request",
+        id: "first-notice",
+        method: "notify",
+        message: "Only show this once",
+        notifyType: "warning",
+      },
+    });
+    current = reduceEvent(current, {
+      seq: 2,
+      projectId: "project",
+      type: "pi_event",
+      event: {
+        type: "extension_ui_request",
+        id: "duplicate-notice",
+        method: "notify",
+        message: "Only show this once",
+        notifyType: "warning",
+      },
+    });
+
+    expect(current.runtimes.project.notifications).toHaveLength(1);
+    const key = current.runtimes.project.notifications[0].key;
+    current = dismissNotificationInState(
+      {
+        ...current,
+        runtimes: {
+          ...current.runtimes,
+          other: {
+            ...createRuntime(),
+            notifications: [...current.runtimes.project.notifications],
+          },
+        },
+      },
+      key,
+    );
+    expect(current.runtimes.project.notifications).toEqual([]);
+    expect(current.runtimes.other.notifications).toEqual([]);
+    expect(current.dismissedNotificationKeys).toEqual([key]);
+    current = reduceEvent(current, {
+      seq: 3,
+      projectId: "other",
+      type: "pi_event",
+      event: {
+        type: "extension_ui_request",
+        id: "other-project-notice",
+        method: "notify",
+        message: "Only show this once",
+        notifyType: "warning",
+      },
+    });
+
+    expect(current.runtimes.other.notifications).toEqual([]);
   });
 
   it("surfaces extension failures and clears transient UI when the process restarts", () => {

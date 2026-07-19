@@ -55,6 +55,7 @@ function storeState(currentProject = project): AppStoreState {
     activeProjectId: currentProject.id,
     environment: null,
     providers: [],
+    dismissedNotificationKeys: [],
     runtimes: { [currentProject.id]: createRuntime() },
     sidebarOpen: true,
     settingsOpen: false,

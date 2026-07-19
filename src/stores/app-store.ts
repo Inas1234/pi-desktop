@@ -67,6 +67,7 @@ const initialState: AppStoreState = {
   activeProjectId: null,
   environment: null,
   providers: [],
+  dismissedNotificationKeys: [],
   runtimes: {},
   sidebarOpen: true,
   settingsOpen: false,
@@ -341,10 +342,21 @@ function boundedRecord<T>(
   return Object.fromEntries(entries.slice(-limit)) as Record<string, T>;
 }
 
+function notificationKey(message: string, tone: "info" | "warning" | "error"): string {
+  const input = `${tone}\0${message}`;
+  let hash = 0xcbf29ce484222325n;
+  for (const character of input) {
+    hash ^= BigInt(character.codePointAt(0) ?? 0);
+    hash = BigInt.asUintN(64, hash * 0x100000001b3n);
+  }
+  return `v1-${input.length.toString(36)}-${hash.toString(16).padStart(16, "0")}`;
+}
+
 function applyPiEvent(
   runtime: ProjectRuntime,
   value: Record<string, unknown>,
   seq: number | string,
+  dismissedNotificationKeys: string[],
 ): ProjectRuntime {
   const eventType = typeof value.type === "string" ? value.type : "unknown";
   if (eventType === "agent_start") {
@@ -531,13 +543,22 @@ function applyPiEvent(
       const tone = ["info", "warning", "error"].includes(String(request.notifyType))
         ? (request.notifyType as "info" | "warning" | "error")
         : "info";
+      const message = stripTerminalFormatting(String(request.message ?? ""));
+      const key = notificationKey(message, tone);
+      if (
+        dismissedNotificationKeys.includes(key) ||
+        runtime.notifications.some((notification) => notification.key === key)
+      ) {
+        return runtime;
+      }
       return {
         ...runtime,
         notifications: [
           ...runtime.notifications,
           {
             id: request.id,
-            message: stripTerminalFormatting(String(request.message ?? "")),
+            key,
+            message,
             tone,
           },
         ].slice(-10),
@@ -648,10 +669,13 @@ export function reduceEvent(source: AppStoreState, event: AppEvent): AppStoreSta
         warning: null,
       };
     }
-    if (event.type === "pi_event") return applyPiEvent(runtime, event.event, event.seq);
+    if (event.type === "pi_event") {
+      return applyPiEvent(runtime, event.event, event.seq, next.dismissedNotificationKeys);
+    }
     if (event.type === "pi_events") {
       return event.events.reduce(
-        (current, value, index) => applyPiEvent(current, value, `${event.seq}:${index}`),
+        (current, value, index) =>
+          applyPiEvent(current, value, `${event.seq}:${index}`, next.dismissedNotificationKeys),
         runtime,
       );
     }
@@ -678,6 +702,23 @@ export function reduceEvent(source: AppStoreState, event: AppEvent): AppStoreSta
     if (event.type === "resync_required") return { ...runtime, warning: event.reason };
     return runtime;
   });
+}
+
+export function dismissNotificationInState(source: AppStoreState, key: string): AppStoreState {
+  const dismissedNotificationKeys = [
+    ...source.dismissedNotificationKeys.filter((entry) => entry !== key),
+    key,
+  ].slice(-256);
+  const runtimes = Object.fromEntries(
+    Object.entries(source.runtimes).map(([projectId, runtime]) => [
+      projectId,
+      {
+        ...runtime,
+        notifications: runtime.notifications.filter((notification) => notification.key !== key),
+      },
+    ]),
+  );
+  return { ...source, dismissedNotificationKeys, runtimes };
 }
 
 const eventQueue: AppEvent[] = [];
@@ -782,6 +823,7 @@ export const appStore = {
         activeProjectId,
         environment: bootstrap.environment,
         providers: bootstrap.providers,
+        dismissedNotificationKeys: bootstrap.dismissedNotificationKeys,
         runtimes,
         sidebarOpen: !bootstrap.settings.sidebarCollapsed,
       });
@@ -947,15 +989,13 @@ export const appStore = {
   showError(message: string) {
     patch({ error: message });
   },
-  clearNotification(projectId: string, notificationId?: string) {
-    publish(
-      updateRuntime(state, projectId, (runtime) => ({
-        ...runtime,
-        notifications: notificationId
-          ? runtime.notifications.filter((notification) => notification.id !== notificationId)
-          : runtime.notifications.slice(1),
-      })),
-    );
+  async dismissNotification(key: string) {
+    publish(dismissNotificationInState(state, key));
+    try {
+      await desktop.dismissNotification(key);
+    } catch (error) {
+      patch({ error: errorMessage(error) });
+    }
   },
   _replaceForTest(next: AppStoreState) {
     publish(next);

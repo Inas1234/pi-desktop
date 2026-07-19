@@ -40,6 +40,7 @@ const previewBootstrap: BootstrapState = {
     message: "Run through Tauri to connect to Pi.",
   },
   providers: [],
+  dismissedNotificationKeys: [],
 };
 
 async function call<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -115,6 +116,7 @@ export const desktop = {
     call<ProviderCredentialStatus[]>("set_provider_key", { providerId, secret }),
   deleteProviderKey: (providerId: string) =>
     call<ProviderCredentialStatus[]>("delete_provider_key", { providerId }),
+  dismissNotification: (key: string) => call<void>("dismiss_notification", { key }),
   getSettings: () => call<AppSettings>("get_settings"),
   updateSettings: (patch: Partial<AppSettings>) => call<AppSettings>("update_settings", { patch }),
   openPiLogin: () => call<void>("open_pi_login"),

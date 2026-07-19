@@ -46,6 +46,8 @@ pub struct AppConfig {
     pub settings: AppSettings,
     #[serde(default)]
     pub projects: Vec<ProjectRecord>,
+    #[serde(default)]
+    pub dismissed_notification_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -86,6 +88,7 @@ pub struct BootstrapState {
     pub projects: Vec<ProjectRecord>,
     pub environment: PiEnvironmentReport,
     pub providers: Vec<ProviderCredentialStatus>,
+    pub dismissed_notification_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

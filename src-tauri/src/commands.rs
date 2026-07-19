@@ -36,6 +36,7 @@ pub async fn initialize(
         projects: config.projects,
         environment: state.manager.diagnose_pi(),
         providers: state.manager.credentials.list_statuses(),
+        dismissed_notification_keys: config.dismissed_notification_keys,
     })
 }
 
@@ -356,6 +357,11 @@ pub async fn update_settings(
         state.manager.restart_running_projects().await;
     }
     Ok(settings)
+}
+
+#[tauri::command]
+pub fn dismiss_notification(key: String, state: State<'_, AppState>) -> AppResult<()> {
+    state.manager.config.dismiss_notification(key)
 }
 
 #[tauri::command]

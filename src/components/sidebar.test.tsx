@@ -63,6 +63,7 @@ function sidebarState(betaLoaded = true): AppStoreState {
     activeProjectId: "alpha",
     environment: null,
     providers: [],
+    dismissedNotificationKeys: [],
     runtimes: { alpha, beta },
     sidebarOpen: true,
     settingsOpen: false,

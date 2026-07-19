@@ -79,6 +79,7 @@ pub fn run() {
             commands::delete_provider_key,
             commands::get_settings,
             commands::update_settings,
+            commands::dismiss_notification,
             commands::open_pi_login,
             commands::list_pi_packages,
             commands::browse_pi_package_catalog,

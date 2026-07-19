@@ -175,7 +175,7 @@ export default function App() {
             <button
               type="button"
               className={`app-toast ${runtime.notifications[0].tone}`}
-              onClick={() => appStore.clearNotification(project.id, runtime.notifications[0]?.id)}
+              onClick={() => void appStore.dismissNotification(runtime.notifications[0].key)}
             >
               <span>{runtime.notifications[0].message}</span>
               <small>Dismiss</small>

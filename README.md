@@ -46,6 +46,7 @@ There is no embedded Node backend and no second conversation database.
 - Navigate suggestions with Up/Down, complete with Tab or Enter, and dismiss with Escape.
 - Support queued Pi extension UI requests for select, confirm, input, editor, notifications,
   status, above/below-composer widgets, titles, and editor-text updates.
+- Remember dismissed extension notifications across projects, reconnects, and app restarts.
 - Render displayable extension custom messages and bounded extension failures live and after session
   reloads.
 

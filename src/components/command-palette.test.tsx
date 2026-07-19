@@ -23,6 +23,7 @@ describe("CommandPalette", () => {
       activeProjectId: "project",
       environment: null,
       providers: [],
+      dismissedNotificationKeys: [],
       runtimes: { project: createRuntime() },
       sidebarOpen: true,
       settingsOpen: false,

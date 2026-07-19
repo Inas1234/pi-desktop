@@ -42,6 +42,7 @@ export interface BootstrapState {
   projects: ProjectRecord[];
   environment: PiEnvironmentReport;
   providers: ProviderCredentialStatus[];
+  dismissedNotificationKeys: string[];
 }
 
 export interface SessionSummary {
@@ -163,6 +164,7 @@ export interface ExtensionUIRequest {
 
 export interface ExtensionNotification {
   id: string;
+  key: string;
   message: string;
   tone: "info" | "warning" | "error";
 }
@@ -304,6 +306,7 @@ export interface AppStoreState {
   activeProjectId: string | null;
   environment: PiEnvironmentReport | null;
   providers: ProviderCredentialStatus[];
+  dismissedNotificationKeys: string[];
   runtimes: Record<string, ProjectRuntime>;
   sidebarOpen: boolean;
   settingsOpen: boolean;

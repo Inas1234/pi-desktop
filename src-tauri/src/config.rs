@@ -8,6 +8,9 @@ use crate::{
     models::{AppConfig, AppSettings, ProjectRecord, SettingsPatch},
 };
 
+const MAX_DISMISSED_NOTIFICATIONS: usize = 256;
+const MAX_NOTIFICATION_KEY_BYTES: usize = 96;
+
 pub struct ConfigStore {
     path: PathBuf,
     config: RwLock<AppConfig>,
@@ -21,11 +24,21 @@ impl ConfigStore {
         let dir = dirs.config_dir();
         fs::create_dir_all(dir)?;
         let path = dir.join("config.json");
-        let config = if path.exists() {
+        let mut config = if path.exists() {
             serde_json::from_slice(&fs::read(&path)?)?
         } else {
             AppConfig::default()
         };
+        config
+            .dismissed_notification_keys
+            .retain(|key| !key.is_empty() && key.len() <= MAX_NOTIFICATION_KEY_BYTES);
+        let overflow = config
+            .dismissed_notification_keys
+            .len()
+            .saturating_sub(MAX_DISMISSED_NOTIFICATIONS);
+        if overflow > 0 {
+            config.dismissed_notification_keys.drain(..overflow);
+        }
 
         Ok(Self {
             path,
@@ -94,6 +107,26 @@ impl ConfigStore {
         })
     }
 
+    pub fn dismiss_notification(&self, key: String) -> AppResult<()> {
+        if key.is_empty() || key.len() > MAX_NOTIFICATION_KEY_BYTES {
+            return Err(AppError::Message("Invalid notification key".into()));
+        }
+        self.mutate(|config| {
+            config
+                .dismissed_notification_keys
+                .retain(|existing| existing != &key);
+            config.dismissed_notification_keys.push(key);
+            let overflow = config
+                .dismissed_notification_keys
+                .len()
+                .saturating_sub(MAX_DISMISSED_NOTIFICATIONS);
+            if overflow > 0 {
+                config.dismissed_notification_keys.drain(..overflow);
+            }
+            Ok(())
+        })
+    }
+
     fn persist(&self, config: &AppConfig) -> AppResult<()> {
         let parent = self
             .path
@@ -105,5 +138,45 @@ impl ConfigStore {
         temp.persist(&self.path)
             .map_err(|error| AppError::Io(error.error))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dismissed_notifications_are_deduplicated_bounded_and_persisted() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        let existing = (0..MAX_DISMISSED_NOTIFICATIONS)
+            .map(|index| format!("key-{index}"))
+            .collect();
+        let store = ConfigStore::for_test(
+            path.clone(),
+            AppConfig {
+                dismissed_notification_keys: existing,
+                ..AppConfig::default()
+            },
+        );
+
+        store.dismiss_notification("key-0".into()).unwrap();
+        store.dismiss_notification("new-key".into()).unwrap();
+
+        let snapshot = store.snapshot();
+        let keys = &snapshot.dismissed_notification_keys;
+        assert_eq!(keys.len(), MAX_DISMISSED_NOTIFICATIONS);
+        assert!(!keys.contains(&"key-1".to_owned()));
+        assert_eq!(keys.iter().filter(|key| key.as_str() == "key-0").count(), 1);
+        assert_eq!(keys.last().map(String::as_str), Some("new-key"));
+
+        let persisted: AppConfig = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(persisted.dismissed_notification_keys, *keys);
+    }
+
+    #[test]
+    fn older_configs_default_to_no_dismissed_notifications() {
+        let config: AppConfig = serde_json::from_str(r#"{"projects": []}"#).unwrap();
+        assert!(config.dismissed_notification_keys.is_empty());
     }
 }

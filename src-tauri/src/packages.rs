@@ -803,6 +803,7 @@ mod tests {
                     ..AppSettings::default()
                 },
                 projects: vec![project],
+                ..AppConfig::default()
             },
         ));
         let packages = super::PiPackageManager::new(config)
