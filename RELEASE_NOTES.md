@@ -1,11 +1,18 @@
-# Pi Desktop 0.1.0 preview
+# Pi Desktop 0.2.0 preview
 
-This is the first packaged Windows preview of Pi Desktop, a chat-focused graphical client for the
-Pi coding agent.
+This preview makes Pi Desktop substantially smoother when several chats are active in one project.
+You can move to another chat without aborting ongoing work, follow compact running/attention markers
+in the sidebar, and reopen a working chat in place. Runtime concurrency remains bounded to the
+selected chat plus at most three detached working chats per project.
 
-Highlights include multi-project sessions, streaming chat and tools, model selection, extension UI
-support, Pi package management, Windows Credential Manager integration, bounded JSONL transport,
-and recoverable session deletion.
+Other highlights:
+
+- faster warm startup from bounded session-summary and command caches;
+- compact subagent fleet cards with per-agent details;
+- credential and Pi-version checks moved away from the critical startup path;
+- a jump-to-latest control anchored above the composer;
+- row-local, two-step session deletion controls;
+- contribution, conduct, security, issue, and pull-request guidance for the public repository.
 
 Requirements:
 

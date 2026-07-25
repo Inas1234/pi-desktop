@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -48,6 +48,10 @@ pub struct AppConfig {
     pub projects: Vec<ProjectRecord>,
     #[serde(default)]
     pub dismissed_notification_keys: Vec<String>,
+    #[serde(default)]
+    pub cached_command_catalogs: HashMap<String, Vec<Value>>,
+    #[serde(default)]
+    pub cached_session_summaries: HashMap<String, Vec<SessionSummary>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -89,10 +93,12 @@ pub struct BootstrapState {
     pub environment: PiEnvironmentReport,
     pub providers: Vec<ProviderCredentialStatus>,
     pub dismissed_notification_keys: Vec<String>,
+    pub cached_command_catalogs: HashMap<String, Vec<Value>>,
+    pub cached_session_summaries: HashMap<String, Vec<SessionSummary>>,
     pub startup_warning: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionSummary {
     pub id: String,

@@ -41,6 +41,8 @@ const previewBootstrap: BootstrapState = {
   },
   providers: [],
   dismissedNotificationKeys: [],
+  cachedCommandCatalogs: {},
+  cachedSessionSummaries: {},
   startupWarning: null,
 };
 
@@ -74,8 +76,13 @@ export const desktop = {
     call<void>("rename_session", { projectId, name }),
   trashSession: (projectId: string, sessionPath: string) =>
     call<void>("trash_session", { projectId, sessionPath }),
-  loadSessionPage: (projectId: string, before: string | null, limit = 100) =>
-    call<SessionPage>("load_session_page", { projectId, before, limit }),
+  loadSessionPage: (projectId: string, before: string | null, limit = 100, sessionPath?: string) =>
+    call<SessionPage>("load_session_page", {
+      projectId,
+      sessionPath: sessionPath ?? null,
+      before,
+      limit,
+    }),
   sendPrompt: (projectId: string, text: string, paths: string[]) =>
     call<void>("send_prompt", { projectId, text, images: paths.map((path) => ({ path })) }),
   steer: (projectId: string, text: string, paths: string[]) =>

@@ -43,6 +43,12 @@ export function Composer({
   const [suggestionsDismissed, setSuggestionsDismissed] = useState(false);
   const textarea = useRef<HTMLTextAreaElement>(null);
   const model = runtime.state.model;
+  const sessionChanging = Boolean(runtime.sessionSwitchingTo || runtime.sessionTransitionPending);
+  const sessionChangeLabel = runtime.sessionTransitionPending
+    ? runtime.sessionTransitionPending.kind === "new"
+      ? "Opening new session..."
+      : "Opening session..."
+    : "Opening session...";
   const thinking = runtime.state.thinkingLevel ?? "off";
   const pending = runtime.state.pendingMessageCount ?? 0;
   const context = contextPercent(runtime);
@@ -117,6 +123,7 @@ export function Composer({
   }
 
   function submit(behavior?: "prompt" | "steer" | "follow_up") {
+    if (sessionChanging) return;
     if (!text.trim() && !images.length) return;
     if (!images.length && runDesktopCommand(text)) return;
     const interactiveCommand = !images.length
@@ -195,7 +202,16 @@ export function Composer({
           rows={1}
           spellCheck
           aria-label="Message Pi"
-          placeholder={runtime.isStreaming ? "> steer pi..." : "> ask pi or run /command..."}
+          disabled={sessionChanging}
+          placeholder={
+            sessionChanging
+              ? runtime.sessionTransitionPending && !runtime.isSettled
+                ? "> session change queued..."
+                : "> opening session..."
+              : runtime.isStreaming
+                ? "> steer pi..."
+                : "> ask pi or run /command..."
+          }
           onChange={(event) => {
             setText(event.target.value);
             setActiveCommand(0);
@@ -313,7 +329,7 @@ export function Composer({
               variant="primary"
               size="icon"
               aria-label={runtime.isStreaming ? "Steer Pi" : "Send message"}
-              disabled={!text.trim() && !images.length}
+              disabled={sessionChanging || (!text.trim() && !images.length)}
               onClick={() => submit()}
             >
               <ArrowUp size={16} />
@@ -321,7 +337,9 @@ export function Composer({
           </div>
         </div>
         <div className="composer-hint">
-          Enter {runtime.isStreaming ? "steers" : "sends"} · Alt+Enter queues · Shift+Enter newline
+          {sessionChanging
+            ? sessionChangeLabel
+            : `Enter ${runtime.isStreaming ? "steers" : "sends"} · Alt+Enter queues · Shift+Enter newline`}
         </div>
       </div>
       {belowWidgets.length > 0 && (

@@ -8,7 +8,7 @@ Pi still owns model access, tools, extensions, provider integrations, queues, an
 files. The desktop app owns process lifecycle, protocol transport, credentials, and presentation.
 There is no embedded Node backend and no second conversation database.
 
-> Pi Desktop 0.1.0 is a preview release. The core desktop workflow is usable, but the Windows
+> Pi Desktop 0.2.0 is a preview release. The core desktop workflow is usable, but the Windows
 > installer is not yet Authenticode-signed and may trigger an unknown-publisher warning.
 
 ## What works today
@@ -18,9 +18,16 @@ There is no embedded Node backend and no second conversation database.
 - Open multiple local projects and switch between them from the sidebar.
 - Choose whether each project is trusted before Pi loads project-local settings, extensions,
   prompts, skills, or packages.
-- Run one lazily started Pi RPC process per active project.
+- Run one lazily started Pi RPC process for the selected chat, with up to three bounded detached
+  processes only while other chats in that project are still working.
 - Browse, search, create, open, rename, and recycle Pi's existing JSONL sessions.
+- Open or create another chat immediately without aborting the current run; active background chats
+  remain visible through compact sidebar activity markers and can be reopened in place.
+- Select settled sessions immediately while their bounded transcript and live Pi state reconcile in
+  the background.
 - Load long transcripts in pages instead of copying the entire session into the WebView.
+- Restore bounded session summaries and command metadata immediately, then revalidate them against
+  Pi and the session directory in the background.
 - Keep background projects running and stop settled, inactive processes after the configured idle
   timeout.
 
@@ -29,7 +36,7 @@ There is no embedded Node backend and no second conversation database.
 - Stream assistant text and reasoning into the conversation.
 - Render completed messages as safe Markdown with raw HTML disabled.
 - Display adaptive tool cards with summaries, streaming text, safe completed Markdown, structured
-  trees, and compact object tables for built-in and extension tools.
+  trees, compact object tables, and detected subagent fleets with per-agent activity details.
 - Accumulate bounded tool-output tails and structured details without flooding the frontend.
 - Show queue state, context usage, active model, thinking level, and connection state.
 - Send prompts, steer an active run, queue a follow-up, attach images, or abort work.
@@ -151,7 +158,7 @@ but it cannot spawn or communicate with Pi because those capabilities live in Ta
 
 Versioned installers and SHA-256 checksums are published on the
 [GitHub Releases page](https://github.com/Inas1234/pi-desktop/releases).
-For the unsigned 0.1.0 preview, compare the downloaded installer against `SHA256SUMS.txt` before
+For the unsigned 0.2.0 preview, compare the downloaded installer against `SHA256SUMS.txt` before
 running it. Windows SmartScreen may display an unknown-publisher warning until the project has a
 trusted Authenticode signing identity.
 
@@ -227,7 +234,7 @@ Rust ProjectManager
   |
   |  stdin/stdout JSONL RPC
   v
-Pi CLI process (one per running project)
+Pi CLI process (one selected chat plus at most three working background chats per project)
   |-- models and providers
   |-- tools and extensions
   |-- queues and compaction
@@ -267,7 +274,9 @@ src-tauri/
 
 Pi session files remain in Pi's normal session directories and keep Pi's native tree format. The app
 stores only non-secret preferences such as projects, trust choices, active sessions, theme, window
-state, Pi path, and idle timeout.
+state, Pi path, and idle timeout. It also keeps bounded, derived session-summary and command caches
+for warm startup. The transcript is never copied into app configuration and always loads from Pi's
+active JSONL session.
 
 Project trust controls whether Pi may load project-local settings, extensions, prompts, skills, and
 packages. It does **not** add a second tool-approval layer or change Pi's execution semantics.
@@ -338,6 +347,10 @@ cannot access Tauri commands.
 
 ## Contributing
 
-Read [AGENTS.md](./AGENTS.md) before changing the project. It documents the architectural ownership
-boundaries, performance constraints, coding conventions, and expected verification for changes.
-Pi Desktop is available under the [MIT License](./LICENSE).
+Contributions are welcome. Start with [CONTRIBUTING.md](./CONTRIBUTING.md), then read
+[AGENTS.md](./AGENTS.md) for the architectural ownership boundaries, performance constraints,
+coding conventions, and expected verification. Participation is governed by the
+[Code of Conduct](./CODE_OF_CONDUCT.md).
+
+Pi Desktop is available under the [MIT License](./LICENSE). Please report security issues through
+the private process in [SECURITY.md](./SECURITY.md), not a public issue.

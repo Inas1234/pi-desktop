@@ -21,6 +21,16 @@ export function Conversation({
   const parentRef = useRef<HTMLDivElement>(null);
   const previousScrollHeight = useRef(0);
   const [pinned, setPinned] = useState(true);
+  const sessionChanging = Boolean(runtime.sessionSwitchingTo || runtime.sessionTransitionPending);
+  const sessionChangeLabel = runtime.sessionTransitionPending
+    ? runtime.isSettled
+      ? runtime.sessionTransitionPending.kind === "new"
+        ? "Opening new session"
+        : "Opening session"
+      : runtime.sessionTransitionPending.kind === "new"
+        ? "New session queued — finishing the current response"
+        : "Session switch queued — finishing the current response"
+    : "Opening session";
   const virtualizer = useVirtualizer({
     count: runtime.messages.length,
     getScrollElement: () => parentRef.current,
@@ -52,6 +62,15 @@ export function Conversation({
     }
   }
 
+  if (sessionChanging && !runtime.messages.length) {
+    return (
+      <div className="conversation-empty" role="status">
+        <LoaderCircle className="spin" size={17} />
+        <p>{sessionChangeLabel}...</p>
+      </div>
+    );
+  }
+
   if (!runtime.messages.length) {
     return (
       <div className="conversation-empty">
@@ -79,40 +98,52 @@ export function Conversation({
   }
 
   return (
-    <div ref={parentRef} className="conversation-scroll" onScroll={trackScroll}>
-      {runtime.historyLoading && (
-        <div className="history-loading">
-          <LoaderCircle className="spin" size={13} /> Loading earlier messages
+    <div className="conversation-region">
+      <div
+        ref={parentRef}
+        className="conversation-scroll"
+        aria-busy={sessionChanging}
+        onScroll={trackScroll}
+      >
+        {sessionChanging && (
+          <div className="history-loading">
+            <LoaderCircle className="spin" size={13} /> {sessionChangeLabel}
+          </div>
+        )}
+        {runtime.historyLoading && (
+          <div className="history-loading">
+            <LoaderCircle className="spin" size={13} /> Loading earlier messages
+          </div>
+        )}
+        {runtime.warning && (
+          <div className="protocol-warning">
+            {runtime.warning}
+            <Button variant="ghost" size="sm" onClick={() => window.location.reload()}>
+              <RotateCcw size={13} /> Resync
+            </Button>
+          </div>
+        )}
+        <div className="conversation-virtual" style={{ height: virtualizer.getTotalSize() }}>
+          {virtualizer.getVirtualItems().map((row) => {
+            const item = runtime.messages[row.index];
+            return (
+              <div
+                ref={virtualizer.measureElement}
+                data-index={row.index}
+                className="conversation-row"
+                key={item.id}
+                style={{ transform: `translateY(${row.start}px)` }}
+              >
+                {item.type === "message" && (
+                  <MessageItem message={item} showReasoning={showReasoning} />
+                )}
+                {item.type === "tool" && <ToolCard tool={item} />}
+                {item.type === "custom" && <CustomMessage message={item} />}
+                {item.type === "notice" && <div className={`notice ${item.tone}`}>{item.text}</div>}
+              </div>
+            );
+          })}
         </div>
-      )}
-      {runtime.warning && (
-        <div className="protocol-warning">
-          {runtime.warning}
-          <Button variant="ghost" size="sm" onClick={() => window.location.reload()}>
-            <RotateCcw size={13} /> Resync
-          </Button>
-        </div>
-      )}
-      <div className="conversation-virtual" style={{ height: virtualizer.getTotalSize() }}>
-        {virtualizer.getVirtualItems().map((row) => {
-          const item = runtime.messages[row.index];
-          return (
-            <div
-              ref={virtualizer.measureElement}
-              data-index={row.index}
-              className="conversation-row"
-              key={item.id}
-              style={{ transform: `translateY(${row.start}px)` }}
-            >
-              {item.type === "message" && (
-                <MessageItem message={item} showReasoning={showReasoning} />
-              )}
-              {item.type === "tool" && <ToolCard tool={item} />}
-              {item.type === "custom" && <CustomMessage message={item} />}
-              {item.type === "notice" && <div className={`notice ${item.tone}`}>{item.text}</div>}
-            </div>
-          );
-        })}
       </div>
       {!pinned && (
         <Button

@@ -16,11 +16,35 @@ pub struct CredentialStore;
 
 impl CredentialStore {
     pub fn list_statuses(&self) -> Vec<ProviderCredentialStatus> {
+        self.statuses(true)
+    }
+
+    pub fn list_statuses_without_app_credentials(&self) -> Vec<ProviderCredentialStatus> {
+        self.statuses(false)
+    }
+
+    fn statuses(&self, inspect_app_credentials: bool) -> Vec<ProviderCredentialStatus> {
         let pi_auth = pi_auth_provider_ids();
+        let app_credentials = if inspect_app_credentials {
+            std::thread::scope(|scope| {
+                let checks = simple_key_providers()
+                    .into_iter()
+                    .map(|provider| {
+                        scope.spawn(move || (provider.id, self.has_secret(provider.id)))
+                    })
+                    .collect::<Vec<_>>();
+                checks
+                    .into_iter()
+                    .filter_map(|check| check.join().ok())
+                    .collect::<HashMap<_, _>>()
+            })
+        } else {
+            HashMap::new()
+        };
         simple_key_providers()
             .into_iter()
             .map(|provider| {
-                let configured_in_app = self.has_secret(provider.id);
+                let configured_in_app = app_credentials.get(provider.id).copied().unwrap_or(false);
                 let configured_in_pi = pi_auth.contains_key(provider.id);
                 let effective_source = if configured_in_pi {
                     "pi".to_owned()
@@ -70,13 +94,21 @@ impl CredentialStore {
     }
 
     pub fn environment(&self) -> HashMap<String, Zeroizing<String>> {
-        simple_key_providers()
-            .into_iter()
-            .filter_map(|provider| {
-                let value = self.get_secret(provider.id)?;
-                Some((provider.environment_variable.to_owned(), value))
-            })
-            .collect()
+        std::thread::scope(|scope| {
+            let reads = simple_key_providers()
+                .into_iter()
+                .map(|provider| {
+                    scope.spawn(move || {
+                        let value = self.get_secret(provider.id)?;
+                        Some((provider.environment_variable.to_owned(), value))
+                    })
+                })
+                .collect::<Vec<_>>();
+            reads
+                .into_iter()
+                .filter_map(|read| read.join().ok().flatten())
+                .collect()
+        })
     }
 
     fn has_secret(&self, provider_id: &str) -> bool {

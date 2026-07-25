@@ -121,4 +121,48 @@ describe("Sidebar", () => {
     expect(await screen.findByRole("button", { name: "Retry loading sessions" })).toBeVisible();
     expect(desktop.listSessions).toHaveBeenCalledTimes(1);
   });
+
+  it("keeps session deletion controls attached to the selected session row", async () => {
+    appStore._replaceForTest(sidebarState());
+    vi.spyOn(desktop, "trashSession").mockResolvedValue(undefined);
+    vi.spyOn(desktop, "listSessions").mockResolvedValue([
+      session("beta-release", "Prepare release"),
+    ]);
+    const user = userEvent.setup();
+    render(<Sidebar />);
+
+    await user.click(screen.getByRole("button", { name: "Expand Beta" }));
+    const sessionButton = screen.getByRole("button", { name: "Open session Prepare release" });
+    await user.click(screen.getByRole("button", { name: "Delete session Prepare release" }));
+
+    const confirm = screen.getByRole("button", {
+      name: "Move Prepare release to Recycle Bin",
+    });
+    expect(confirm.closest(".session-row")).toBe(sessionButton.parentElement);
+
+    await user.click(confirm);
+    await waitFor(() => {
+      expect(desktop.trashSession).toHaveBeenCalledWith("beta", "D:\\sessions\\beta-release.jsonl");
+    });
+  });
+
+  it("selects a cross-project session before the backend switch finishes", async () => {
+    appStore._replaceForTest(sidebarState());
+    vi.spyOn(desktop, "openSession").mockReturnValue(new Promise(() => undefined));
+    vi.spyOn(desktop, "loadSessionPage").mockReturnValue(new Promise(() => undefined));
+    const selectProject = vi.spyOn(appStore, "selectProject");
+    const user = userEvent.setup();
+    render(<Sidebar />);
+
+    await user.click(screen.getByRole("button", { name: "Expand Beta" }));
+    const sessionButton = screen.getByRole("button", { name: "Open session Prepare release" });
+    await user.click(sessionButton);
+
+    expect(appStore.getSnapshot().activeProjectId).toBe("beta");
+    expect(appStore.getSnapshot().projects[1].activeSession).toBe(
+      "D:\\sessions\\beta-release.jsonl",
+    );
+    expect(sessionButton.parentElement).toHaveAttribute("data-active", "true");
+    expect(selectProject).not.toHaveBeenCalled();
+  });
 });

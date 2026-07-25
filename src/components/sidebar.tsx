@@ -1,4 +1,3 @@
-import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   ChevronRight,
@@ -52,6 +51,8 @@ export function Sidebar() {
     () => new Set(activeProjectId ? [activeProjectId] : []),
   );
   const [sessionLimits, setSessionLimits] = useState<Record<string, number>>({});
+  const [pendingDeletePath, setPendingDeletePath] = useState<string | null>(null);
+  const [deletingSessionPath, setDeletingSessionPath] = useState<string | null>(null);
 
   useEffect(() => {
     if (!activeProjectId) return;
@@ -103,8 +104,18 @@ export function Sidebar() {
   }
 
   async function openSession(projectId: string, sessionPath: string) {
-    if (projectId !== activeProjectId) await appStore.selectProject(projectId);
     await appStore.openSession(projectId, sessionPath);
+  }
+
+  async function trashSession(projectId: string, sessionPath: string) {
+    setDeletingSessionPath(sessionPath);
+    try {
+      await desktop.trashSession(projectId, sessionPath);
+      await appStore.refreshSessions(projectId);
+      setPendingDeletePath(null);
+    } finally {
+      setDeletingSessionPath(null);
+    }
   }
 
   return (
@@ -154,6 +165,9 @@ export function Sidebar() {
             );
             const limit = sessionLimits[project.id] ?? INITIAL_SESSION_LIMIT;
             const visibleSessions = filteredSessions.slice(0, limit);
+            const sessionChanging = Boolean(
+              runtime?.sessionSwitchingTo || runtime?.sessionTransitionPending,
+            );
 
             return (
               <section
@@ -187,7 +201,13 @@ export function Sidebar() {
                     {runtime?.connection === "starting" ? (
                       <LoaderCircle className="spin" size={12} />
                     ) : (
-                      <span className={`run-dot ${runtime?.isStreaming ? "active" : ""}`} />
+                      <span
+                        className={`run-dot ${
+                          runtime?.isStreaming || Object.keys(runtime?.sessionActivity ?? {}).length
+                            ? "active"
+                            : ""
+                        }`}
+                      />
                     )}
                   </button>
                   <Button
@@ -195,10 +215,19 @@ export function Sidebar() {
                     variant="ghost"
                     size="compact"
                     aria-label={`New session in ${project.name}`}
-                    title={`New session in ${project.name}`}
+                    title={
+                      sessionChanging
+                        ? "A session change is already queued"
+                        : `New session in ${project.name}`
+                    }
+                    disabled={sessionChanging}
                     onClick={() => void createSession(project.id)}
                   >
-                    <MessageSquarePlus size={13} />
+                    {sessionChanging ? (
+                      <LoaderCircle className="spin" size={13} />
+                    ) : (
+                      <MessageSquarePlus size={13} />
+                    )}
                   </Button>
                 </div>
 
@@ -234,49 +263,75 @@ export function Sidebar() {
                     {visibleSessions.map((session) => {
                       const title = sessionTitle(session);
                       const selected = project.id === activeProjectId && session.isActive;
+                      const activity =
+                        selected && runtime?.isStreaming
+                          ? "running"
+                          : runtime?.sessionActivity[session.id];
                       return (
-                        <div className="session-row" data-active={selected} key={session.path}>
+                        <div
+                          className="session-row"
+                          data-active={selected}
+                          data-activity={activity}
+                          key={session.path}
+                        >
                           <button
                             type="button"
                             className="session-row-open"
                             aria-label={`Open session ${title}`}
+                            disabled={sessionChanging}
                             onClick={() => void openSession(project.id, session.path)}
                           >
-                            <span className="session-prefix">{selected ? ">" : "·"}</span>
+                            <span className="session-prefix">
+                              {selected
+                                ? ">"
+                                : activity === "attention"
+                                  ? "!"
+                                  : activity
+                                    ? "●"
+                                    : "·"}
+                            </span>
                             <strong>{title}</strong>
                             <time>{relativeTime(session.updatedAt)}</time>
                           </button>
-                          {!session.isActive && (
-                            <DropdownMenu.Root>
-                              <DropdownMenu.Trigger asChild>
+                          {!session.isActive &&
+                            (pendingDeletePath === session.path ? (
+                              <div className="session-delete-actions">
                                 <button
                                   type="button"
-                                  className="session-more"
-                                  aria-label={`Session menu for ${title}`}
+                                  className="session-delete-confirm"
+                                  aria-label={`Move ${title} to Recycle Bin`}
+                                  title="Move to Recycle Bin"
+                                  disabled={deletingSessionPath === session.path}
+                                  onClick={() => void trashSession(project.id, session.path)}
                                 >
-                                  <MoreHorizontal size={13} />
+                                  {deletingSessionPath === session.path ? (
+                                    <LoaderCircle className="spin" size={12} />
+                                  ) : (
+                                    <Trash2 size={12} />
+                                  )}
                                 </button>
-                              </DropdownMenu.Trigger>
-                              <DropdownMenu.Portal>
-                                <DropdownMenu.Content
-                                  className="menu-content"
-                                  side="right"
-                                  align="start"
+                                <button
+                                  type="button"
+                                  className="session-delete-cancel"
+                                  aria-label={`Cancel deleting ${title}`}
+                                  title="Cancel"
+                                  disabled={deletingSessionPath === session.path}
+                                  onClick={() => setPendingDeletePath(null)}
                                 >
-                                  <DropdownMenu.Item
-                                    className="menu-item danger-text"
-                                    onSelect={() =>
-                                      void desktop
-                                        .trashSession(project.id, session.path)
-                                        .then(() => appStore.refreshSessions(project.id))
-                                    }
-                                  >
-                                    <Trash2 size={14} /> Move to Recycle Bin
-                                  </DropdownMenu.Item>
-                                </DropdownMenu.Content>
-                              </DropdownMenu.Portal>
-                            </DropdownMenu.Root>
-                          )}
+                                  &times;
+                                </button>
+                              </div>
+                            ) : (
+                              <button
+                                type="button"
+                                className="session-more"
+                                aria-label={`Delete session ${title}`}
+                                title="Delete session"
+                                onClick={() => setPendingDeletePath(session.path)}
+                              >
+                                <MoreHorizontal size={13} />
+                              </button>
+                            ))}
                         </div>
                       );
                     })}

@@ -71,4 +71,29 @@ describe("Composer command catalog", () => {
     expect(showError).toHaveBeenCalledWith(expect.stringContaining("Pi's terminal UI"));
     expect(send).not.toHaveBeenCalled();
   });
+
+  it("does not accept a prompt until the selected session is ready", () => {
+    const runtime = createRuntime();
+    runtime.sessionSwitchingTo = "D:\\sessions\\next.jsonl";
+
+    render(<Composer project={project} runtime={runtime} />);
+
+    expect(screen.getByRole("textbox", { name: "Message Pi" })).toBeDisabled();
+    expect(screen.getByText("Opening session...")).toBeVisible();
+  });
+
+  it("keeps input disabled during a concurrent new-session handoff", () => {
+    const runtime = createRuntime();
+    runtime.isStreaming = true;
+    runtime.isSettled = false;
+    runtime.sessionTransitionPending = {
+      kind: "new",
+      fromSessionId: "current",
+    };
+
+    render(<Composer project={project} runtime={runtime} />);
+
+    expect(screen.getByRole("textbox", { name: "Message Pi" })).toBeDisabled();
+    expect(screen.getByText("Opening new session...")).toBeVisible();
+  });
 });

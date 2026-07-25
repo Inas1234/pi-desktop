@@ -35,8 +35,13 @@ pub async fn initialize(
         settings: config.settings,
         projects: config.projects,
         environment: state.manager.diagnose_pi(),
-        providers: state.manager.credentials.list_statuses(),
+        providers: state
+            .manager
+            .credentials
+            .list_statuses_without_app_credentials(),
         dismissed_notification_keys: config.dismissed_notification_keys,
+        cached_command_catalogs: config.cached_command_catalogs,
+        cached_session_summaries: config.cached_session_summaries,
         startup_warning: state.manager.config.startup_warning(),
     })
 }
@@ -58,11 +63,16 @@ pub async fn add_project(
     }
     let now = chrono::Utc::now().to_rfc3339();
     state.manager.config.mutate(|config| {
-        if let Some(existing) = config
+        if let Some(index) = config
             .projects
-            .iter_mut()
-            .find(|project| project.path == path)
+            .iter()
+            .position(|project| project.path == path)
         {
+            let project_id = config.projects[index].id.clone();
+            if config.projects[index].trusted != trusted {
+                config.cached_command_catalogs.remove(&project_id);
+            }
+            let existing = &mut config.projects[index];
             existing.trusted = trusted;
             existing.last_opened_at = now.clone();
             config.settings.active_project_id = Some(existing.id.clone());
@@ -93,6 +103,8 @@ pub async fn remove_project(project_id: String, state: State<'_, AppState>) -> A
     state.manager.config.mutate(|config| {
         let original = config.projects.len();
         config.projects.retain(|project| project.id != project_id);
+        config.cached_command_catalogs.remove(&project_id);
+        config.cached_session_summaries.remove(&project_id);
         if original == config.projects.len() {
             return Err(AppError::ProjectNotFound);
         }
@@ -111,11 +123,15 @@ pub async fn update_project_trust(
     state: State<'_, AppState>,
 ) -> AppResult<ProjectRecord> {
     let project = state.manager.config.mutate(|config| {
-        let project = config
+        let index = config
             .projects
-            .iter_mut()
-            .find(|project| project.id == project_id)
+            .iter()
+            .position(|project| project.id == project_id)
             .ok_or(AppError::ProjectNotFound)?;
+        if config.projects[index].trusted != trusted {
+            config.cached_command_catalogs.remove(&project_id);
+        }
+        let project = &mut config.projects[index];
         project.trusted = trusted;
         Ok(project.clone())
     })?;
@@ -151,9 +167,18 @@ pub async fn list_sessions(
         .config
         .project(&project_id)
         .ok_or(AppError::ProjectNotFound)?;
-    tokio::task::spawn_blocking(move || sessions::list_sessions(&project, query.as_deref()))
-        .await
-        .map_err(|error| AppError::Message(format!("Session scan failed: {error}")))?
+    let should_cache = query.as_deref().is_none_or(str::is_empty);
+    let sessions =
+        tokio::task::spawn_blocking(move || sessions::list_sessions(&project, query.as_deref()))
+            .await
+            .map_err(|error| AppError::Message(format!("Session scan failed: {error}")))??;
+    if should_cache {
+        state
+            .manager
+            .config
+            .cache_session_summaries(&project_id, sessions.clone());
+    }
+    Ok(sessions)
 }
 
 #[tauri::command]
@@ -203,6 +228,7 @@ pub async fn trash_session(
 #[tauri::command]
 pub async fn load_session_page(
     project_id: String,
+    session_path: Option<PathBuf>,
     before: Option<String>,
     limit: Option<usize>,
     state: State<'_, AppState>,
@@ -212,9 +238,9 @@ pub async fn load_session_page(
         .config
         .project(&project_id)
         .ok_or(AppError::ProjectNotFound)?;
-    let session = project
-        .active_session
+    let session = session_path
         .as_deref()
+        .or(project.active_session.as_deref())
         .ok_or_else(|| AppError::Message("This session has not been written to disk yet".into()))?;
     let path = sessions::ensure_session_owned(&project, session)?;
     tokio::task::spawn_blocking(move || {
@@ -317,8 +343,13 @@ pub async fn respond_extension_ui(
 }
 
 #[tauri::command]
-pub fn list_provider_credentials(state: State<'_, AppState>) -> Vec<ProviderCredentialStatus> {
-    state.manager.credentials.list_statuses()
+pub async fn list_provider_credentials(
+    state: State<'_, AppState>,
+) -> AppResult<Vec<ProviderCredentialStatus>> {
+    let credentials = state.manager.credentials.clone();
+    tokio::task::spawn_blocking(move || credentials.list_statuses())
+        .await
+        .map_err(|error| AppError::Message(format!("Credential scan failed: {error}")))
 }
 
 #[tauri::command]

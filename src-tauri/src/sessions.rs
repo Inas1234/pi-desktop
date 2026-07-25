@@ -472,12 +472,12 @@ fn read_summary(path: &Path, active_session: Option<&Path>) -> AppResult<Session
             continue;
         };
         if let Some(timestamp) = value.get("timestamp").and_then(Value::as_str) {
-            updated_at = timestamp.to_owned();
+            updated_at = truncate(timestamp, 64);
         }
         match value.get("type").and_then(Value::as_str) {
             Some("session") => {
                 if let Some(session_id) = value.get("id").and_then(Value::as_str) {
-                    id = session_id.to_owned();
+                    id = truncate(session_id, 256);
                 }
             }
             Some("session_info") => {
@@ -485,7 +485,7 @@ fn read_summary(path: &Path, active_session: Option<&Path>) -> AppResult<Session
                     .get("name")
                     .or_else(|| value.get("data").and_then(|data| data.get("name")))
                     .and_then(Value::as_str)
-                    .map(str::to_owned)
+                    .map(|value| truncate(value, 256))
                     .or(name);
             }
             Some("message") => {

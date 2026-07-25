@@ -75,7 +75,7 @@ describe("adaptive extension rendering", () => {
     expect(screen.getByText("Details (truncated)")).toBeVisible();
   });
 
-  it("uses the same safe text and structured viewer for custom messages", async () => {
+  it("detects subagent custom messages and opens each reported agent", async () => {
     const { container } = render(
       <CustomMessage
         message={{
@@ -90,8 +90,13 @@ describe("adaptive extension rendering", () => {
       />,
     );
 
-    expect(await screen.findByText("Two agents")).toBeVisible();
-    expect(screen.getByText("[ext] subagents")).toBeVisible();
+    expect(screen.getByText("2 subagents")).toBeVisible();
+    expect(screen.getByText("2 subagents").closest(".subagent-header")).toHaveTextContent(
+      "parallel · 2 done",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Open subagent one" }));
+    expect(await screen.findByRole("dialog")).toHaveTextContent("one · subagent");
+    expect(screen.getByText(/does not expose its child transcript/i)).toBeVisible();
     expect(container.querySelector("script")).toBeNull();
   });
 });

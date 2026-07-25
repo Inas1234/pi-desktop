@@ -43,6 +43,8 @@ export interface BootstrapState {
   environment: PiEnvironmentReport;
   providers: ProviderCredentialStatus[];
   dismissedNotificationKeys: string[];
+  cachedCommandCatalogs: Record<string, PiCommand[]>;
+  cachedSessionSummaries: Record<string, SessionSummary[]>;
   startupWarning: string | null;
 }
 
@@ -265,6 +267,13 @@ export interface PackageProgress {
   message: string;
 }
 
+export interface SessionTransition {
+  kind: "new" | "switch";
+  sessionPath?: string;
+  fromSessionId?: string;
+  fromSessionFile?: string;
+}
+
 export interface PackageOperationResult {
   packages: PiPackageRecord[];
   restartedProjectIds: string[];
@@ -286,6 +295,10 @@ export interface ProjectRuntime {
   historyCursor: string | null;
   hasOlder: boolean;
   historyLoading: boolean;
+  sessionSwitchingTo: string | null;
+  sessionTransitionPending: SessionTransition | null;
+  sessionActivity: Record<string, "running" | "attention">;
+  backgroundExtensionRequests: Record<string, ExtensionUIRequest[]>;
   isStreaming: boolean;
   isSettled: boolean;
   currentAssistantId: string | null;

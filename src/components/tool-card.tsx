@@ -2,6 +2,8 @@ import * as m from "motion/react-m";
 import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 
 import { StructuredData } from "@/components/structured-data";
+import { SubagentCard } from "@/components/subagent-card";
+import { subagentGroupFromTool } from "@/lib/subagents";
 import { toolLineChanges } from "@/lib/tool-line-changes";
 import type { ToolItem } from "@/lib/types";
 
@@ -36,7 +38,7 @@ function summary(tool: ToolItem): string {
   return collection ? `${collection[0]}:${(collection[1] as unknown[]).length}` : "custom tool";
 }
 
-export function ToolCard({ tool }: { tool: ToolItem }) {
+function GenericToolCard({ tool }: { tool: ToolItem }) {
   const [expanded, setExpanded] = useState(tool.status !== "success");
   const detail = useMemo(() => summary(tool), [tool]);
   const lineChanges = useMemo(() => toolLineChanges(tool), [tool]);
@@ -113,4 +115,9 @@ export function ToolCard({ tool }: { tool: ToolItem }) {
       )}
     </m.section>
   );
+}
+
+export function ToolCard({ tool }: { tool: ToolItem }) {
+  const subagents = useMemo(() => subagentGroupFromTool(tool), [tool]);
+  return subagents ? <SubagentCard group={subagents} /> : <GenericToolCard tool={tool} />;
 }

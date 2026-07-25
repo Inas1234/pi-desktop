@@ -17,7 +17,7 @@ use tauri::ipc::Channel;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::{Child, ChildStdin, Command},
-    sync::{Mutex, RwLock, mpsc, oneshot},
+    sync::{Mutex, Notify, RwLock, mpsc, oneshot},
     time::{MissedTickBehavior, interval, timeout},
 };
 use uuid::Uuid;
@@ -41,6 +41,7 @@ const MAX_BLOCKING_DIALOGS: usize = 16;
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_BACKGROUND_RUNTIMES_PER_PROJECT: usize = 3;
 
 enum ProcessControl {
     Stop,
@@ -54,9 +55,16 @@ struct ProcessWaitState {
 
 struct ProjectRuntime {
     token: String,
+    session_id: ParkingRwLock<Option<String>>,
+    session_path: ParkingRwLock<Option<PathBuf>>,
     stdin: Mutex<ChildStdin>,
     pending: Mutex<HashMap<String, oneshot::Sender<AppResult<Value>>>>,
     command_catalog: ParkingMutex<Option<Vec<Value>>>,
+    bootstrap_generation: AtomicU64,
+    session_switch_generation: AtomicU64,
+    session_transition: Mutex<()>,
+    session_transition_pending: AtomicBool,
+    settled_signal: Notify,
     control: mpsc::Sender<ProcessControl>,
     termination: Mutex<Option<oneshot::Receiver<()>>>,
     settled: AtomicBool,
@@ -64,6 +72,7 @@ struct ProjectRuntime {
     blocking_dialogs: ParkingMutex<HashSet<String>>,
     last_touched: AtomicU64,
     expected_exit: AtomicBool,
+    terminated: AtomicBool,
     stderr: Mutex<VecDeque<String>>,
 }
 
@@ -77,12 +86,51 @@ impl ProjectRuntime {
     fn touch(&self) {
         self.last_touched.store(now_millis(), Ordering::Relaxed);
     }
+
+    fn session_id(&self) -> Option<String> {
+        self.session_id.read().clone()
+    }
+
+    fn session_path(&self) -> Option<PathBuf> {
+        self.session_path.read().clone()
+    }
+
+    fn set_session_identity(&self, session_id: Option<String>, session_path: Option<PathBuf>) {
+        *self.session_id.write() = session_id;
+        *self.session_path.write() = session_path;
+    }
+}
+
+struct SessionTransitionGuard {
+    runtime: Arc<ProjectRuntime>,
+}
+
+impl SessionTransitionGuard {
+    fn begin(runtime: Arc<ProjectRuntime>) -> AppResult<Self> {
+        runtime
+            .session_transition_pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| AppError::Message("A session change is already in progress".into()))?;
+        runtime
+            .session_switch_generation
+            .fetch_add(1, Ordering::AcqRel);
+        Ok(Self { runtime })
+    }
+}
+
+impl Drop for SessionTransitionGuard {
+    fn drop(&mut self) {
+        self.runtime
+            .session_transition_pending
+            .store(false, Ordering::Release);
+    }
 }
 
 pub struct ProjectManager {
     pub config: Arc<ConfigStore>,
     pub credentials: Arc<CredentialStore>,
     runtimes: RwLock<HashMap<String, Arc<ProjectRuntime>>>,
+    background_runtimes: RwLock<HashMap<String, HashMap<String, Arc<ProjectRuntime>>>>,
     channel: ParkingRwLock<Option<Channel<AppEvent>>>,
     sequence: AtomicU64,
     crash_restarts: Mutex<HashMap<String, u64>>,
@@ -94,6 +142,7 @@ impl ProjectManager {
             config,
             credentials,
             runtimes: RwLock::new(HashMap::new()),
+            background_runtimes: RwLock::new(HashMap::new()),
             channel: ParkingRwLock::new(None),
             sequence: AtomicU64::new(1),
             crash_restarts: Mutex::new(HashMap::new()),
@@ -108,18 +157,35 @@ impl ProjectManager {
         diagnose(self.config.settings().pi_path)
     }
 
+    async fn active_runtime(&self, project_id: &str) -> AppResult<Arc<ProjectRuntime>> {
+        self.runtimes
+            .read()
+            .await
+            .get(project_id)
+            .cloned()
+            .ok_or(AppError::PiNotRunning)
+    }
+
     pub async fn is_running(&self, project_id: &str) -> bool {
-        self.runtimes.read().await.contains_key(project_id)
+        if self.runtimes.read().await.contains_key(project_id) {
+            return true;
+        }
+        self.background_runtimes
+            .read()
+            .await
+            .get(project_id)
+            .is_some_and(|runtimes| !runtimes.is_empty())
     }
 
     pub async fn restart_running_projects(self: &Arc<Self>) {
-        let ids = self
+        let mut ids = self
             .runtimes
             .read()
             .await
             .keys()
             .cloned()
-            .collect::<Vec<_>>();
+            .collect::<HashSet<_>>();
+        ids.extend(self.background_runtimes.read().await.keys().cloned());
         for id in ids {
             let _ = self.restart_project(&id).await;
         }
@@ -129,29 +195,39 @@ impl ProjectManager {
         self: &Arc<Self>,
         project_id: Option<&str>,
     ) -> AppResult<Vec<String>> {
-        let runtimes = self.runtimes.read().await;
-        let targets = runtimes
-            .iter()
-            .filter(|(id, _)| project_id.is_none_or(|target| target == id.as_str()))
-            .map(|(id, runtime)| (id.clone(), runtime.clone()))
-            .collect::<Vec<_>>();
+        let active = self.runtimes.read().await;
+        let backgrounds = self.background_runtimes.read().await;
+        let mut targets = active
+            .keys()
+            .chain(backgrounds.keys())
+            .filter(|id| project_id.is_none_or(|target| target == id.as_str()))
+            .cloned()
+            .collect::<HashSet<_>>();
         let busy = targets
             .iter()
-            .filter(|(_, runtime)| !runtime.can_suspend())
-            .map(|(id, _)| {
+            .filter(|id| {
+                active
+                    .get(*id)
+                    .is_some_and(|runtime| !runtime.can_suspend())
+                    || backgrounds.get(*id).is_some_and(|runtimes| {
+                        runtimes.values().any(|runtime| !runtime.can_suspend())
+                    })
+            })
+            .map(|id| {
                 self.config
                     .project(id)
                     .map_or_else(|| id.clone(), |project| project.name)
             })
             .collect::<Vec<_>>();
-        drop(runtimes);
+        drop(backgrounds);
+        drop(active);
         if !busy.is_empty() {
             return Err(AppError::Message(format!(
                 "Wait for these Pi projects to settle before changing packages: {}",
                 busy.join(", ")
             )));
         }
-        let ids = targets.into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+        let ids = targets.drain().collect::<Vec<_>>();
         let mut stopped = Vec::new();
         for id in &ids {
             if let Err(error) = self.stop_project(id).await {
@@ -216,8 +292,6 @@ impl ProjectManager {
             .config
             .project(project_id)
             .ok_or(AppError::ProjectNotFound)?;
-        let pi_path = resolve_pi(self.config.settings().pi_path)
-            .ok_or_else(|| AppError::Message("Pi is not installed or configured".into()))?;
 
         self.emit(
             project_id,
@@ -227,6 +301,56 @@ impl ProjectManager {
                 message: None,
             },
         );
+
+        let runtime = self
+            .spawn_runtime(project_id, project.active_session.clone())
+            .await?;
+        let mut runtimes = self.runtimes.write().await;
+        if runtimes.contains_key(project_id) {
+            drop(runtimes);
+            stop_runtime_process(runtime).await?;
+            return Ok(());
+        }
+        runtimes.insert(project_id.to_owned(), runtime.clone());
+        drop(runtimes);
+
+        self.emit(
+            project_id,
+            runtime.session_id(),
+            AppEventKind::Connection {
+                state: "connected".into(),
+                message: None,
+            },
+        );
+
+        let manager = self.clone();
+        let project_id = project_id.to_owned();
+        tokio::spawn(async move {
+            if let Err(error) = manager.bootstrap_runtime(&project_id, &runtime).await {
+                manager.emit_runtime(
+                    &project_id,
+                    &runtime,
+                    AppEventKind::Connection {
+                        state: "error".into(),
+                        message: Some(error.to_string()),
+                    },
+                );
+            }
+        });
+        Ok(())
+    }
+
+    async fn spawn_runtime(
+        self: &Arc<Self>,
+        project_id: &str,
+        session_path: Option<PathBuf>,
+    ) -> AppResult<Arc<ProjectRuntime>> {
+        let project = self
+            .config
+            .project(project_id)
+            .ok_or(AppError::ProjectNotFound)?;
+        let pi_path = resolve_pi(self.config.settings().pi_path)
+            .ok_or_else(|| AppError::Message("Pi is not installed or configured".into()))?;
 
         let mut base = command_for(&pi_path);
         base.current_dir(&project.path)
@@ -242,7 +366,7 @@ impl ProjectManager {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if let Some(session) = project.active_session.as_ref().filter(|path| path.exists()) {
+        if let Some(session) = session_path.as_ref().filter(|path| path.exists()) {
             base.arg("--session").arg(session);
         }
         for (name, secret) in self.credentials.environment() {
@@ -285,9 +409,16 @@ impl ProjectManager {
 
         let runtime = Arc::new(ProjectRuntime {
             token: Uuid::new_v4().to_string(),
+            session_id: ParkingRwLock::new(None),
+            session_path: ParkingRwLock::new(session_path),
             stdin: Mutex::new(stdin),
             pending: Mutex::new(HashMap::new()),
-            command_catalog: ParkingMutex::new(None),
+            command_catalog: ParkingMutex::new(self.config.cached_command_catalog(project_id)),
+            bootstrap_generation: AtomicU64::new(0),
+            session_switch_generation: AtomicU64::new(0),
+            session_transition: Mutex::new(()),
+            session_transition_pending: AtomicBool::new(false),
+            settled_signal: Notify::new(),
             control: control_tx,
             termination: Mutex::new(Some(termination_rx)),
             settled: AtomicBool::new(true),
@@ -295,16 +426,14 @@ impl ProjectManager {
             blocking_dialogs: ParkingMutex::new(HashSet::new()),
             last_touched: AtomicU64::new(now_millis()),
             expected_exit: AtomicBool::new(false),
+            terminated: AtomicBool::new(false),
             stderr: Mutex::new(VecDeque::with_capacity(MAX_STDERR_LINES)),
         });
-        self.runtimes
-            .write()
-            .await
-            .insert(project_id.to_owned(), runtime.clone());
 
         tokio::spawn(event_batch_loop(
             self.clone(),
             project_id.to_owned(),
+            runtime.clone(),
             event_rx,
         ));
         tokio::spawn(stdout_loop(
@@ -327,39 +456,18 @@ impl ProjectManager {
                 job,
             },
         ));
-
-        self.emit(
-            project_id,
-            None,
-            AppEventKind::Connection {
-                state: "connected".into(),
-                message: None,
-            },
-        );
-
-        let manager = self.clone();
-        let project_id = project_id.to_owned();
-        tokio::spawn(async move {
-            if let Err(error) = manager.bootstrap_project(&project_id).await {
-                manager.emit(
-                    &project_id,
-                    None,
-                    AppEventKind::ProtocolWarning {
-                        message: error.to_string(),
-                    },
-                );
-            }
-        });
-        Ok(())
+        Ok(runtime)
     }
 
     pub async fn stop_project(&self, project_id: &str) -> AppResult<()> {
-        let runtime = self.runtimes.write().await.remove(project_id);
-        if let Some(runtime) = runtime {
-            let termination = runtime.termination.lock().await.take();
-            runtime.expected_exit.store(true, Ordering::Relaxed);
-            let _ = runtime.control.send(ProcessControl::Stop).await;
-            fail_pending(&runtime, "Pi was stopped").await;
+        let mut runtimes = Vec::new();
+        if let Some(runtime) = self.runtimes.write().await.remove(project_id) {
+            runtimes.push(runtime);
+        }
+        if let Some(backgrounds) = self.background_runtimes.write().await.remove(project_id) {
+            runtimes.extend(backgrounds.into_values());
+        }
+        if !runtimes.is_empty() {
             self.emit(
                 project_id,
                 None,
@@ -368,13 +476,8 @@ impl ProjectManager {
                     message: None,
                 },
             );
-            if let Some(termination) = termination
-                && timeout(PROCESS_STOP_TIMEOUT, termination).await.is_err()
-            {
-                return Err(AppError::Message(format!(
-                    "Pi did not stop within {} seconds for project {project_id}",
-                    PROCESS_STOP_TIMEOUT.as_secs()
-                )));
+            for runtime in runtimes {
+                stop_runtime_process(runtime).await?;
             }
         }
         Ok(())
@@ -387,13 +490,14 @@ impl ProjectManager {
     }
 
     pub async fn shutdown_all(&self) {
-        let ids = self
+        let mut ids = self
             .runtimes
             .read()
             .await
             .keys()
             .cloned()
-            .collect::<Vec<_>>();
+            .collect::<HashSet<_>>();
+        ids.extend(self.background_runtimes.read().await.keys().cloned());
         for id in ids {
             let _ = self.stop_project(&id).await;
         }
@@ -409,6 +513,22 @@ impl ProjectManager {
                 let settings = manager.config.settings();
                 let cutoff = settings.idle_timeout_minutes.saturating_mul(60_000);
                 let now = now_millis();
+                let background_to_stop = manager
+                    .background_runtimes
+                    .read()
+                    .await
+                    .iter()
+                    .flat_map(|(project_id, runtimes)| {
+                        runtimes
+                            .iter()
+                            .filter(|(_, runtime)| runtime.can_suspend())
+                            .map(|(token, _)| (project_id.clone(), token.clone()))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                for (project_id, token) in background_to_stop {
+                    let _ = manager.retire_background_runtime(&project_id, &token).await;
+                }
                 let runtimes = manager.runtimes.read().await;
                 let to_stop = runtimes
                     .iter()
@@ -429,13 +549,15 @@ impl ProjectManager {
     }
 
     pub async fn rpc(&self, project_id: &str, mut command: Map<String, Value>) -> AppResult<Value> {
-        let runtime = self
-            .runtimes
-            .read()
-            .await
-            .get(project_id)
-            .cloned()
-            .ok_or(AppError::PiNotRunning)?;
+        let runtime = self.active_runtime(project_id).await?;
+        self.rpc_runtime(&runtime, &mut command).await
+    }
+
+    async fn rpc_runtime(
+        &self,
+        runtime: &ProjectRuntime,
+        command: &mut Map<String, Value>,
+    ) -> AppResult<Value> {
         runtime.touch();
         let id = Uuid::new_v4().to_string();
         command.insert("id".into(), Value::String(id.clone()));
@@ -492,8 +614,39 @@ impl ProjectManager {
                 .collect::<AppResult<Vec<_>>>()?;
             command.insert("images".into(), Value::Array(encoded));
         }
-        self.rpc(project_id, command).await?;
-        Ok(())
+        let runtime = self.active_runtime(project_id).await?;
+        let _session_transition = runtime.session_transition.lock().await;
+        if runtime.session_transition_pending.load(Ordering::Acquire) {
+            return Err(AppError::Message(
+                "Wait for the pending session change before sending another message".into(),
+            ));
+        }
+        let was_settled = runtime.settled.swap(false, Ordering::AcqRel);
+        match self.rpc_runtime(&runtime, &mut command).await {
+            Ok(_) => {
+                if was_settled
+                    && let Ok(state) = self.rpc_runtime(&runtime, &mut object("get_state")).await
+                {
+                    update_runtime_identity_from_response(&runtime, &state);
+                    if rpc_reports_session_idle(&runtime, &state) {
+                        runtime.settled.store(true, Ordering::Release);
+                        runtime.settled_signal.notify_one();
+                    }
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if matches!(&error, AppError::Message(_))
+                    && !runtime.terminated.load(Ordering::Acquire)
+                {
+                    runtime.settled.store(was_settled, Ordering::Release);
+                    if was_settled {
+                        runtime.settled_signal.notify_one();
+                    }
+                }
+                Err(error)
+            }
+        }
     }
 
     pub async fn abort(&self, project_id: &str) -> AppResult<()> {
@@ -501,9 +654,20 @@ impl ProjectManager {
         Ok(())
     }
 
-    pub async fn new_session(&self, project_id: &str) -> AppResult<()> {
-        self.rpc(project_id, object("new_session")).await?;
-        self.bootstrap_project(project_id).await
+    pub async fn new_session(self: &Arc<Self>, project_id: &str) -> AppResult<()> {
+        let runtime = self.active_runtime(project_id).await?;
+        let _session_transition = runtime.session_transition.lock().await;
+        self.reconcile_runtime_idle(&runtime).await?;
+        if !runtime.can_suspend() {
+            return self
+                .start_parallel_session(project_id, runtime.clone(), None)
+                .await;
+        }
+        let _pending = SessionTransitionGuard::begin(runtime.clone())?;
+        self.rpc_runtime(&runtime, &mut object("new_session"))
+            .await?;
+        self.persist_active_session(project_id, None)?;
+        self.bootstrap_runtime(project_id, &runtime).await
     }
 
     pub async fn open_session(self: &Arc<Self>, project_id: &str, path: &Path) -> AppResult<()> {
@@ -512,26 +676,226 @@ impl ProjectManager {
             .project(project_id)
             .ok_or(AppError::ProjectNotFound)?;
         let path = sessions::ensure_session_owned(&project, path)?;
+        let runtime = self.runtimes.read().await.get(project_id).cloned();
+        let _session_transition = if let Some(runtime) = runtime.as_ref() {
+            Some(runtime.session_transition.lock().await)
+        } else {
+            None
+        };
+        if self
+            .promote_background_runtime(project_id, &path)
+            .await?
+            .is_some()
+        {
+            return Ok(());
+        }
+        if let Some(runtime) = runtime.as_ref() {
+            if runtime
+                .session_path()
+                .is_some_and(|current| same_session_path(&current, &path))
+            {
+                return Ok(());
+            }
+            self.reconcile_runtime_idle(runtime).await?;
+            if !runtime.can_suspend() {
+                return self
+                    .start_parallel_session(project_id, runtime.clone(), Some(path))
+                    .await;
+            }
+            let _pending = SessionTransitionGuard::begin(runtime.clone())?;
+            let mut command = object("switch_session");
+            command.insert(
+                "sessionPath".into(),
+                Value::String(path.to_string_lossy().into_owned()),
+            );
+            self.rpc_runtime(runtime, &mut command).await?;
+            self.persist_active_session(project_id, Some(path))?;
+            self.bootstrap_runtime(project_id, runtime).await
+        } else {
+            self.persist_active_session(project_id, Some(path))?;
+            self.start_project(project_id).await
+        }
+    }
+
+    fn persist_active_session(&self, project_id: &str, path: Option<PathBuf>) -> AppResult<()> {
+        let now = chrono::Utc::now().to_rfc3339();
         self.config.mutate(|config| {
             let project = config
                 .projects
                 .iter_mut()
                 .find(|project| project.id == project_id)
                 .ok_or(AppError::ProjectNotFound)?;
-            project.active_session = Some(path.clone());
+            project.active_session = path;
+            project.last_opened_at = now;
+            config.settings.active_project_id = Some(project_id.to_owned());
             Ok(())
-        })?;
-        if self.runtimes.read().await.contains_key(project_id) {
-            let mut command = object("switch_session");
-            command.insert(
-                "sessionPath".into(),
-                Value::String(path.to_string_lossy().into_owned()),
-            );
-            self.rpc(project_id, command).await?;
-            self.bootstrap_project(project_id).await
-        } else {
-            self.start_project(project_id).await
+        })
+    }
+
+    async fn reconcile_runtime_idle(&self, runtime: &ProjectRuntime) -> AppResult<()> {
+        if runtime.settled.load(Ordering::Acquire) {
+            return Ok(());
         }
+        let state = self.rpc_runtime(runtime, &mut object("get_state")).await?;
+        if rpc_reports_session_idle(runtime, &state) {
+            runtime.settled.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    async fn start_parallel_session(
+        self: &Arc<Self>,
+        project_id: &str,
+        runtime: Arc<ProjectRuntime>,
+        session_path: Option<PathBuf>,
+    ) -> AppResult<()> {
+        let previous_path = runtime.session_path();
+        self.detach_active_runtime(project_id, &runtime).await?;
+        if let Err(error) = self.persist_active_session(project_id, session_path) {
+            self.restore_detached_runtime(project_id, &runtime).await;
+            return Err(error);
+        }
+        if let Err(error) = self.start_project(project_id).await {
+            self.restore_detached_runtime(project_id, &runtime).await;
+            let _ = self.persist_active_session(project_id, previous_path);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn detach_active_runtime(
+        &self,
+        project_id: &str,
+        runtime: &Arc<ProjectRuntime>,
+    ) -> AppResult<()> {
+        let (background_count, settled) = {
+            let mut all_backgrounds = self.background_runtimes.write().await;
+            if let Some(backgrounds) = all_backgrounds.get_mut(project_id) {
+                let settled_tokens = backgrounds
+                    .iter()
+                    .filter(|(_, runtime)| runtime.can_suspend())
+                    .map(|(token, _)| token.clone())
+                    .collect::<Vec<_>>();
+                let settled = settled_tokens
+                    .into_iter()
+                    .filter_map(|token| backgrounds.remove(&token))
+                    .collect::<Vec<_>>();
+                (backgrounds.len(), settled)
+            } else {
+                (0, Vec::new())
+            }
+        };
+        for runtime in settled {
+            tokio::spawn(async move {
+                let _ = stop_runtime_process(runtime).await;
+            });
+        }
+        if background_count >= MAX_BACKGROUND_RUNTIMES_PER_PROJECT {
+            return Err(AppError::Message(format!(
+                "Up to {} Pi chats can run at once in a project. Wait for one to finish before starting another.",
+                MAX_BACKGROUND_RUNTIMES_PER_PROJECT + 1
+            )));
+        }
+        let removed = self.runtimes.write().await.remove(project_id);
+        if removed
+            .as_ref()
+            .is_none_or(|active| active.token != runtime.token)
+        {
+            if let Some(active) = removed {
+                self.runtimes
+                    .write()
+                    .await
+                    .insert(project_id.to_owned(), active);
+            }
+            return Err(AppError::Message("The active Pi session changed".into()));
+        }
+        self.background_runtimes
+            .write()
+            .await
+            .entry(project_id.to_owned())
+            .or_default()
+            .insert(runtime.token.clone(), runtime.clone());
+        Ok(())
+    }
+
+    async fn restore_detached_runtime(&self, project_id: &str, runtime: &Arc<ProjectRuntime>) {
+        if let Some(backgrounds) = self.background_runtimes.write().await.get_mut(project_id) {
+            backgrounds.remove(&runtime.token);
+        }
+        self.runtimes
+            .write()
+            .await
+            .insert(project_id.to_owned(), runtime.clone());
+    }
+
+    async fn promote_background_runtime(
+        self: &Arc<Self>,
+        project_id: &str,
+        path: &Path,
+    ) -> AppResult<Option<Arc<ProjectRuntime>>> {
+        let target = {
+            let mut all_backgrounds = self.background_runtimes.write().await;
+            let Some(backgrounds) = all_backgrounds.get_mut(project_id) else {
+                return Ok(None);
+            };
+            let token = backgrounds.iter().find_map(|(token, runtime)| {
+                runtime
+                    .session_path()
+                    .filter(|candidate| same_session_path(candidate, path))
+                    .map(|_| token.clone())
+            });
+            token.and_then(|token| backgrounds.remove(&token))
+        };
+        let Some(target) = target else {
+            return Ok(None);
+        };
+
+        if let Err(error) = self.persist_active_session(project_id, Some(path.to_path_buf())) {
+            self.background_runtimes
+                .write()
+                .await
+                .entry(project_id.to_owned())
+                .or_default()
+                .insert(target.token.clone(), target);
+            return Err(error);
+        }
+
+        let previous = self
+            .runtimes
+            .write()
+            .await
+            .insert(project_id.to_owned(), target.clone());
+        if let Some(previous) = previous.filter(|runtime| runtime.token != target.token) {
+            if previous.can_suspend() {
+                tokio::spawn(async move {
+                    let _ = stop_runtime_process(previous).await;
+                });
+            } else {
+                self.background_runtimes
+                    .write()
+                    .await
+                    .entry(project_id.to_owned())
+                    .or_default()
+                    .insert(previous.token.clone(), previous);
+            }
+        }
+        target.touch();
+        let manager = self.clone();
+        let project_id = project_id.to_owned();
+        let runtime = target.clone();
+        tokio::spawn(async move {
+            if let Err(error) = manager.bootstrap_runtime(&project_id, &runtime).await {
+                manager.emit_runtime(
+                    &project_id,
+                    &runtime,
+                    AppEventKind::Connection {
+                        state: "error".into(),
+                        message: Some(error.to_string()),
+                    },
+                );
+            }
+        });
+        Ok(Some(target))
     }
 
     pub async fn rename_session(&self, project_id: &str, name: String) -> AppResult<()> {
@@ -593,29 +957,66 @@ impl ProjectManager {
     }
 
     async fn bootstrap_project(&self, project_id: &str) -> AppResult<()> {
-        let state = data(self.rpc(project_id, object("get_state")).await?);
-        let models_response = data(self.rpc(project_id, object("get_available_models")).await?);
-        let commands = self.command_catalog(project_id).await?;
-        let stats =
-            data(self.rpc(project_id, object("get_session_stats")).await?).unwrap_or(Value::Null);
+        let runtime = self.active_runtime(project_id).await?;
+        self.bootstrap_runtime(project_id, &runtime).await
+    }
 
-        let state = state.unwrap_or(Value::Null);
+    async fn bootstrap_runtime(
+        &self,
+        project_id: &str,
+        runtime: &Arc<ProjectRuntime>,
+    ) -> AppResult<()> {
+        let generation = runtime.bootstrap_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let state = data(self.rpc_runtime(runtime, &mut object("get_state")).await?);
+        let mut state = state.unwrap_or(Value::Null);
+        if let Some(path) = state.get("sessionFile").and_then(Value::as_str) {
+            let normalized = normalize_windows_verbatim_path(path);
+            if normalized != path {
+                state["sessionFile"] = Value::String(normalized);
+            }
+        }
         let session_path = state
             .get("sessionFile")
             .and_then(Value::as_str)
-            .map(PathBuf::from);
-        let page = if let Some(path) = session_path.clone().filter(|path| path.exists()) {
+            .map(PathBuf::from)
+            .or_else(|| runtime.session_path());
+        if state.get("sessionFile").is_none()
+            && let Some(path) = session_path.as_ref()
+        {
+            state["sessionFile"] = Value::String(path.to_string_lossy().into_owned());
+        }
+        let session_id = state
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| runtime.session_id());
+        runtime.set_session_identity(session_id.clone(), session_path.clone());
+        let page_path = session_path.clone();
+        let page = async move {
+            let path = page_path.filter(|path| path.exists())?;
             tokio::task::spawn_blocking(move || sessions::load_message_page(&path, None, 200))
                 .await
                 .ok()
                 .and_then(Result::ok)
-        } else {
-            None
         };
+        let mut models_command = object("get_available_models");
+        let mut stats_command = object("get_session_stats");
+        let (models_response, commands, stats_response, page) = tokio::join!(
+            self.rpc_runtime(runtime, &mut models_command),
+            self.command_catalog_for_runtime(project_id, runtime),
+            self.rpc_runtime(runtime, &mut stats_command),
+            page,
+        );
+        let models_response = data(models_response?);
+        let commands = commands?;
+        let stats = data(stats_response?).unwrap_or(Value::Null);
         let (messages, history_cursor, has_older) = if let Some(page) = page {
             (page.messages, page.cursor, page.has_older)
         } else {
-            let messages_response = data(self.rpc(project_id, object("get_messages")).await?);
+            let messages_response = data(
+                self.rpc_runtime(runtime, &mut object("get_messages"))
+                    .await?,
+            );
             let mut messages = array_field(messages_response.as_ref(), "messages");
             if messages.len() > 200 {
                 messages = messages.split_off(messages.len() - 200);
@@ -626,11 +1027,24 @@ impl ProjectManager {
             (messages, None, false)
         };
         let models = array_field(models_response.as_ref(), "models");
-        let session_id = state
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        if let Some(path) = session_path {
+        if runtime.bootstrap_generation.load(Ordering::Relaxed) != generation {
+            return Ok(());
+        }
+        let is_active = self
+            .runtimes
+            .read()
+            .await
+            .get(project_id)
+            .is_some_and(|active| active.token == runtime.token);
+        if is_active
+            && let Some(path) = session_path
+            && self
+                .config
+                .project(project_id)
+                .and_then(|project| project.active_session)
+                .as_ref()
+                .is_none_or(|current| !same_session_path(current, &path))
+        {
             self.config.mutate(|config| {
                 if let Some(project) = config
                     .projects
@@ -642,9 +1056,9 @@ impl ProjectManager {
                 Ok(())
             })?;
         }
-        self.emit(
+        self.emit_runtime(
             project_id,
-            session_id,
+            runtime,
             AppEventKind::Snapshot {
                 state,
                 messages,
@@ -658,29 +1072,80 @@ impl ProjectManager {
         Ok(())
     }
 
-    async fn command_catalog(&self, project_id: &str) -> AppResult<Vec<Value>> {
-        let runtime = self
+    async fn refresh_settled_runtime(
+        self: &Arc<Self>,
+        project_id: &str,
+        runtime: Arc<ProjectRuntime>,
+        session_generation: u64,
+    ) -> AppResult<()> {
+        let is_active = self
             .runtimes
             .read()
             .await
             .get(project_id)
-            .cloned()
-            .ok_or(AppError::PiNotRunning)?;
+            .is_some_and(|active| active.token == runtime.token);
+        let is_background = self
+            .background_runtimes
+            .read()
+            .await
+            .get(project_id)
+            .is_some_and(|runtimes| runtimes.contains_key(&runtime.token));
+        if !is_active && !is_background {
+            return Ok(());
+        }
+        let _session_transition = runtime.session_transition.lock().await;
+        if runtime.terminated.load(Ordering::Acquire)
+            || runtime.session_transition_pending.load(Ordering::Acquire)
+            || runtime.session_switch_generation.load(Ordering::Acquire) != session_generation
+        {
+            return Ok(());
+        }
+        self.bootstrap_runtime(project_id, &runtime).await?;
+        if is_background && runtime.can_suspend() {
+            self.retire_background_runtime(project_id, &runtime.token)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn command_catalog_for_runtime(
+        &self,
+        project_id: &str,
+        runtime: &ProjectRuntime,
+    ) -> AppResult<Vec<Value>> {
         if let Some(commands) = runtime.command_catalog.lock().as_ref() {
             return Ok(commands.clone());
         }
 
-        let response = match self.rpc(project_id, object("get_command_catalog")).await {
+        let response = match self
+            .rpc_runtime(runtime, &mut object("get_command_catalog"))
+            .await
+        {
             Ok(response) => response,
             Err(error) if is_unknown_command(&error, "get_command_catalog") => {
-                self.rpc(project_id, object("get_commands")).await?
+                self.rpc_runtime(runtime, &mut object("get_commands"))
+                    .await?
             }
             Err(error) => return Err(error),
         };
         let response_data = data(response);
         let commands = array_field(response_data.as_ref(), "commands");
+        self.config.cache_command_catalog(project_id, &commands);
         *runtime.command_catalog.lock() = Some(commands.clone());
         Ok(commands)
+    }
+
+    async fn retire_background_runtime(&self, project_id: &str, token: &str) -> AppResult<()> {
+        let runtime = self
+            .background_runtimes
+            .write()
+            .await
+            .get_mut(project_id)
+            .and_then(|runtimes| runtimes.remove(token));
+        if let Some(runtime) = runtime {
+            stop_runtime_process(runtime).await?;
+        }
+        Ok(())
     }
 
     fn emit(&self, project_id: &str, session_id: Option<String>, event: AppEventKind) {
@@ -695,28 +1160,41 @@ impl ProjectManager {
         });
     }
 
+    fn emit_runtime(&self, project_id: &str, runtime: &ProjectRuntime, event: AppEventKind) {
+        self.emit(project_id, runtime.session_id(), event);
+    }
+
     async fn handle_exit(
         self: &Arc<Self>,
         project_id: &str,
         token: &str,
+        runtime: Arc<ProjectRuntime>,
         code: Option<i32>,
         expected: bool,
     ) {
         let mut runtimes = self.runtimes.write().await;
-        if runtimes
+        let active = if runtimes
             .get(project_id)
             .is_some_and(|runtime| runtime.token == token)
-            && let Some(runtime) = runtimes.remove(project_id)
         {
-            fail_pending(&runtime, "Pi exited").await;
-        }
+            runtimes.remove(project_id);
+            true
+        } else {
+            false
+        };
         drop(runtimes);
-        self.emit(
+        if let Some(backgrounds) = self.background_runtimes.write().await.get_mut(project_id) {
+            backgrounds.remove(token);
+        }
+        runtime.terminated.store(true, Ordering::Release);
+        runtime.settled_signal.notify_one();
+        fail_pending(&runtime, "Pi exited").await;
+        self.emit_runtime(
             project_id,
-            None,
+            &runtime,
             AppEventKind::ProcessExited { code, expected },
         );
-        if !expected {
+        if active && !expected {
             let now = now_millis();
             let should_restart = {
                 let mut restarts = self.crash_restarts.lock().await;
@@ -829,9 +1307,9 @@ async fn stdout_loop(
         let count = match stdout.read(&mut chunk).await {
             Ok(count) => count,
             Err(error) => {
-                manager.emit(
+                manager.emit_runtime(
                     &project_id,
-                    None,
+                    &runtime,
                     AppEventKind::ProtocolWarning {
                         message: format!("Unable to read Pi output: {error}"),
                     },
@@ -861,9 +1339,9 @@ async fn process_stdout_frame(
     frame: FramedLine,
 ) -> bool {
     let FramedLine::Line(buffer) = frame else {
-        manager.emit(
+        manager.emit_runtime(
             project_id,
-            None,
+            runtime,
             AppEventKind::ProtocolWarning {
                 message: "Pi emitted an oversized protocol record".into(),
             },
@@ -873,9 +1351,9 @@ async fn process_stdout_frame(
     let mut value = match serde_json::from_slice::<Value>(&buffer) {
         Ok(value) => value,
         Err(error) => {
-            manager.emit(
+            manager.emit_runtime(
                 project_id,
-                None,
+                runtime,
                 AppEventKind::ProtocolWarning {
                     message: format!("Pi emitted invalid JSON: {error}"),
                 },
@@ -898,9 +1376,9 @@ async fn process_stdout_frame(
     let settled = value.get("type").and_then(Value::as_str) == Some("agent_settled");
     if let Some(request_id) = overflowing_extension_request(runtime, &value) {
         let result = cancel_extension_request(runtime, &request_id).await;
-        manager.emit(
+        manager.emit_runtime(
             project_id,
-            None,
+            runtime,
             AppEventKind::ProtocolWarning {
                 message: match result {
                     Ok(()) => format!(
@@ -926,22 +1404,31 @@ async fn process_stdout_frame(
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
             if runtime.blocking_dialogs.lock().remove(&request_id) {
-                manager.emit(
+                manager.emit_runtime(
                     &project_id,
-                    None,
+                    &runtime,
                     AppEventKind::ExtensionUiExpired { request_id },
                 );
             }
         });
     }
     if settled {
+        runtime.settled_signal.notify_one();
+        if runtime.session_transition_pending.load(Ordering::Acquire) {
+            return true;
+        }
         let manager = manager.clone();
         let project_id = project_id.to_owned();
+        let runtime = runtime.clone();
+        let session_generation = runtime.session_switch_generation.load(Ordering::Acquire);
         tokio::spawn(async move {
-            if let Err(error) = manager.bootstrap_project(&project_id).await {
-                manager.emit(
+            if let Err(error) = manager
+                .refresh_settled_runtime(&project_id, runtime.clone(), session_generation)
+                .await
+            {
+                manager.emit_runtime(
                     &project_id,
-                    None,
+                    &runtime,
                     AppEventKind::ProtocolWarning {
                         message: format!("Unable to refresh the settled session: {error}"),
                     },
@@ -1010,6 +1497,7 @@ async fn wait_loop(
         .handle_exit(
             &project_id,
             &token,
+            runtime.clone(),
             status.and_then(|status| status.code()),
             runtime.expected_exit.load(Ordering::Relaxed),
         )
@@ -1019,6 +1507,7 @@ async fn wait_loop(
 async fn event_batch_loop(
     manager: Arc<ProjectManager>,
     project_id: String,
+    runtime: Arc<ProjectRuntime>,
     mut receiver: mpsc::Receiver<Value>,
 ) {
     let mut ticker = interval(Duration::from_millis(33));
@@ -1026,15 +1515,15 @@ async fn event_batch_loop(
     let mut pending = Vec::<Value>::new();
     loop {
         tokio::select! {
-            _ = ticker.tick() => flush_events(&manager, &project_id, &mut pending),
+            _ = ticker.tick() => flush_events(&manager, &project_id, &runtime, &mut pending),
             event = receiver.recv() => match event {
                 Some(event) if is_high_frequency(&event) => merge_event(&mut pending, event),
                 Some(event) => {
-                    flush_events(&manager, &project_id, &mut pending);
-                    manager.emit(&project_id, None, AppEventKind::PiEvent { event });
+                    flush_events(&manager, &project_id, &runtime, &mut pending);
+                    manager.emit_runtime(&project_id, &runtime, AppEventKind::PiEvent { event });
                 }
                 None => {
-                    flush_events(&manager, &project_id, &mut pending);
+                    flush_events(&manager, &project_id, &runtime, &mut pending);
                     break;
                 }
             }
@@ -1042,11 +1531,16 @@ async fn event_batch_loop(
     }
 }
 
-fn flush_events(manager: &ProjectManager, project_id: &str, pending: &mut Vec<Value>) {
+fn flush_events(
+    manager: &ProjectManager,
+    project_id: &str,
+    runtime: &ProjectRuntime,
+    pending: &mut Vec<Value>,
+) {
     if !pending.is_empty() {
-        manager.emit(
+        manager.emit_runtime(
             project_id,
-            None,
+            runtime,
             AppEventKind::PiEvents {
                 events: std::mem::take(pending),
             },
@@ -1119,11 +1613,11 @@ fn is_high_frequency(value: &Value) -> bool {
 fn update_runtime_state(runtime: &ProjectRuntime, value: &Value) {
     match value.get("type").and_then(Value::as_str) {
         Some("agent_start") => {
-            runtime.settled.store(false, Ordering::Relaxed);
+            runtime.settled.store(false, Ordering::Release);
             runtime.touch();
         }
         Some("agent_settled") => {
-            runtime.settled.store(true, Ordering::Relaxed);
+            runtime.settled.store(true, Ordering::Release);
             runtime.touch();
         }
         Some("queue_update") => {
@@ -1200,6 +1694,64 @@ async fn fail_pending(runtime: &ProjectRuntime, message: &str) {
     }
 }
 
+async fn stop_runtime_process(runtime: Arc<ProjectRuntime>) -> AppResult<()> {
+    let termination = runtime.termination.lock().await.take();
+    runtime.expected_exit.store(true, Ordering::Release);
+    runtime.terminated.store(true, Ordering::Release);
+    runtime.settled_signal.notify_one();
+    let _ = runtime.control.send(ProcessControl::Stop).await;
+    fail_pending(&runtime, "Pi was stopped").await;
+    if let Some(termination) = termination
+        && timeout(PROCESS_STOP_TIMEOUT, termination).await.is_err()
+    {
+        return Err(AppError::Message(format!(
+            "Pi did not stop within {} seconds",
+            PROCESS_STOP_TIMEOUT.as_secs()
+        )));
+    }
+    Ok(())
+}
+
+fn rpc_reports_session_idle(runtime: &ProjectRuntime, response: &Value) -> bool {
+    if !rpc_state_is_idle(response) {
+        return false;
+    }
+    runtime.has_queue.store(false, Ordering::Release);
+    runtime.blocking_dialogs.lock().clear();
+    true
+}
+
+fn update_runtime_identity_from_response(runtime: &ProjectRuntime, response: &Value) {
+    let Some(state) = response.get("data") else {
+        return;
+    };
+    let session_id = state
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| runtime.session_id());
+    let session_path = state
+        .get("sessionFile")
+        .and_then(Value::as_str)
+        .map(normalize_windows_verbatim_path)
+        .map(PathBuf::from)
+        .or_else(|| runtime.session_path());
+    runtime.set_session_identity(session_id, session_path);
+}
+
+fn rpc_state_is_idle(response: &Value) -> bool {
+    let Some(state) = response.get("data") else {
+        return false;
+    };
+    state.get("isStreaming").and_then(Value::as_bool) == Some(false)
+        && state.get("isCompacting").and_then(Value::as_bool) != Some(true)
+        && state
+            .get("pendingMessageCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            == 0
+}
+
 async fn wait_for_rpc_response(
     pending: &Mutex<HashMap<String, oneshot::Sender<AppResult<Value>>>>,
     id: &str,
@@ -1227,6 +1779,24 @@ fn object(command_type: &str) -> Map<String, Value> {
 
 fn data(response: Value) -> Option<Value> {
     response.get("data").cloned()
+}
+
+fn normalize_windows_verbatim_path(path: &str) -> String {
+    if let Some(path) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{path}")
+    } else if let Some(path) = path.strip_prefix(r"\\?\") {
+        path.to_owned()
+    } else {
+        path.to_owned()
+    }
+}
+
+fn same_session_path(left: &Path, right: &Path) -> bool {
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => normalize_windows_verbatim_path(&left.to_string_lossy())
+            .eq_ignore_ascii_case(&normalize_windows_verbatim_path(&right.to_string_lossy())),
+    }
 }
 
 fn array_field(value: Option<&Value>, field: &str) -> Vec<Value> {
@@ -1272,7 +1842,11 @@ fn now_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc, time::Duration};
+    use std::{
+        collections::HashMap,
+        sync::{Arc, atomic::Ordering},
+        time::Duration,
+    };
 
     use serde_json::json;
     use tokio::sync::{Mutex, oneshot};
@@ -1286,8 +1860,21 @@ mod tests {
 
     use super::{
         BoundedLfFramer, FramedLine, ProjectManager, is_high_frequency, is_unknown_command,
-        merge_event, object, wait_for_rpc_response,
+        merge_event, normalize_windows_verbatim_path, object, same_session_path,
+        wait_for_rpc_response,
     };
+
+    #[test]
+    fn normalizes_windows_verbatim_session_paths_for_the_frontend() {
+        assert_eq!(
+            normalize_windows_verbatim_path(r"\\?\C:\Users\pi\session.jsonl"),
+            r"C:\Users\pi\session.jsonl"
+        );
+        assert_eq!(
+            normalize_windows_verbatim_path(r"\\?\UNC\server\share\session.jsonl"),
+            r"\\server\share\session.jsonl"
+        );
+    }
 
     #[test]
     fn combines_adjacent_text_deltas() {
@@ -1365,9 +1952,26 @@ mod tests {
         std::fs::write(
             &script,
             r#"$ErrorActionPreference = 'Stop'
+$streaming = $false
+$sessionFile = $null
+for ($index = 0; $index -lt $args.Count - 1; $index++) {
+  if ($args[$index] -eq '--session') { $sessionFile = $args[$index + 1] }
+}
+$sessionId = if ($sessionFile) { [IO.Path]::GetFileNameWithoutExtension($sessionFile) } else { "new-$PID" }
 while (($line = [Console]::In.ReadLine()) -ne $null) {
   if ([string]::IsNullOrWhiteSpace($line)) { continue }
   $request = $line | ConvertFrom-Json
+  if ($request.type -eq 'prompt' -and $request.message -ne '/extension-command') {
+    $streaming = $true
+  } elseif ($request.type -eq 'new_session') {
+    $streaming = $false
+    $sessionFile = $null
+    $sessionId = "new-$PID"
+  } elseif ($request.type -eq 'switch_session') {
+    $streaming = $false
+    $sessionFile = $request.sessionPath
+    $sessionId = [IO.Path]::GetFileNameWithoutExtension($sessionFile)
+  }
   $response = [ordered]@{
     type = 'response'
     id = $request.id
@@ -1377,6 +1981,11 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
       models = @()
       commands = @()
       messages = @()
+      sessionId = $sessionId
+      sessionFile = $sessionFile
+      isStreaming = $streaming
+      isCompacting = $false
+      pendingMessageCount = 0
     }
   }
   [Console]::Out.WriteLine(($response | ConvertTo-Json -Compress -Depth 8))
@@ -1390,11 +1999,29 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
             "@echo off\r\npowershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%~dp0fake-pi.ps1\" %*\r\n",
         )
         .unwrap();
+        let session_directory = directory.path().join("sessions");
+        std::fs::create_dir_all(directory.path().join(".pi")).unwrap();
+        std::fs::create_dir_all(&session_directory).unwrap();
+        std::fs::write(
+            directory.path().join(".pi/settings.json"),
+            format!(
+                r#"{{"sessionDir":{}}}"#,
+                serde_json::to_string(&session_directory).unwrap()
+            ),
+        )
+        .unwrap();
+        let parallel_session = session_directory.join("parallel.jsonl");
+        std::fs::write(
+            &parallel_session,
+            r#"{"type":"session","id":"parallel","timestamp":"2026-07-24T00:00:00Z"}
+"#,
+        )
+        .unwrap();
         let project = ProjectRecord {
             id: "project".into(),
             name: "Fake".into(),
             path: directory.path().to_path_buf(),
-            trusted: false,
+            trusted: true,
             active_session: None,
             created_at: String::new(),
             last_opened_at: String::new(),
@@ -1420,6 +2047,74 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
 
         assert_eq!(first.unwrap().pointer("/data/command").unwrap(), "first");
         assert_eq!(second.unwrap().pointer("/data/command").unwrap(), "second");
+        manager
+            .send_prompt("project", "prompt", "/extension-command".into(), Vec::new())
+            .await
+            .unwrap();
+        let runtime = manager
+            .runtimes
+            .read()
+            .await
+            .get("project")
+            .cloned()
+            .unwrap();
+        assert!(runtime.settled.load(Ordering::Acquire));
+        runtime.settled.store(false, Ordering::Release);
+        runtime.has_queue.store(true, Ordering::Release);
+        runtime.blocking_dialogs.lock().insert("stale".into());
+        tokio::time::timeout(Duration::from_secs(1), manager.new_session("project"))
+            .await
+            .expect("idle state reconciliation should not leave the transition waiting")
+            .unwrap();
+        assert!(!runtime.has_queue.load(Ordering::Acquire));
+        assert!(runtime.blocking_dialogs.lock().is_empty());
+
+        manager
+            .send_prompt("project", "prompt", "keep working".into(), Vec::new())
+            .await
+            .unwrap();
+        assert!(!runtime.settled.load(Ordering::Acquire));
+        let working_session = session_directory.join("working.jsonl");
+        std::fs::write(
+            &working_session,
+            r#"{"type":"session","id":"working","timestamp":"2026-07-24T00:00:00Z"}
+"#,
+        )
+        .unwrap();
+        runtime.set_session_identity(Some("working".into()), Some(working_session.clone()));
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.open_session("project", &parallel_session),
+        )
+        .await
+        .expect("a busy chat should be detached instead of blocking the session switch")
+        .unwrap();
+        let active = manager.active_runtime("project").await.unwrap();
+        assert_ne!(active.token, runtime.token);
+        assert!(
+            active
+                .session_path()
+                .is_some_and(|path| same_session_path(&path, &parallel_session))
+        );
+        assert!(
+            manager
+                .background_runtimes
+                .read()
+                .await
+                .get("project")
+                .is_some_and(|runtimes| runtimes.contains_key(&runtime.token))
+        );
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.open_session("project", &working_session),
+        )
+        .await
+        .expect("reopening a working background chat should promote its existing process")
+        .unwrap();
+        assert_eq!(
+            manager.active_runtime("project").await.unwrap().token,
+            runtime.token
+        );
         manager.stop_project("project").await.unwrap();
         assert!(!manager.is_running("project").await);
     }

@@ -1,4 +1,8 @@
-use std::{path::PathBuf, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use semver::Version;
 
@@ -29,6 +33,22 @@ pub fn diagnose(override_path: Option<PathBuf>) -> PiEnvironmentReport {
             message: "Pi was not found. Install @earendil-works/pi-coding-agent or choose its executable in Settings.".into(),
         };
     };
+
+    if let Some(version) = installed_package_version(&path) {
+        let compatible = is_compatible_version(&version);
+        return PiEnvironmentReport {
+            status: "ready".into(),
+            path: Some(path),
+            version: Some(version.to_string()),
+            compatible,
+            node_path,
+            message: if compatible {
+                "Pi is ready.".into()
+            } else {
+                "Pi Desktop requires Pi 0.80.x.".into()
+            },
+        };
+    }
 
     let output = command_for(&path).arg("--version").output();
     let Ok(output) = output else {
@@ -76,6 +96,34 @@ pub fn diagnose(override_path: Option<PathBuf>) -> PiEnvironmentReport {
     }
 }
 
+fn installed_package_version(executable: &Path) -> Option<Version> {
+    let mut candidates = Vec::new();
+    if let Some(parent) = executable.parent() {
+        candidates.push(
+            parent
+                .join("node_modules")
+                .join("@earendil-works")
+                .join("pi-coding-agent")
+                .join("package.json"),
+        );
+    }
+    if let Ok(target) = fs::canonicalize(executable)
+        && let Some(package_root) = target.parent().and_then(Path::parent)
+    {
+        candidates.push(package_root.join("package.json"));
+    }
+
+    candidates.into_iter().find_map(|candidate| {
+        let bytes = fs::read(candidate).ok()?;
+        let manifest = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?;
+        let name = manifest.get("name").and_then(serde_json::Value::as_str)?;
+        if name != "@earendil-works/pi-coding-agent" {
+            return None;
+        }
+        Version::parse(manifest.get("version")?.as_str()?).ok()
+    })
+}
+
 fn is_compatible_version(version: &Version) -> bool {
     version.major == 0 && version.minor == 80
 }
@@ -93,9 +141,11 @@ pub fn command_for(path: &PathBuf) -> Command {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use semver::Version;
 
-    use super::is_compatible_version;
+    use super::{installed_package_version, is_compatible_version};
 
     #[test]
     fn accepts_only_the_validated_pi_protocol_series() {
@@ -104,5 +154,26 @@ mod tests {
         assert!(!is_compatible_version(&Version::parse("0.79.9").unwrap()));
         assert!(!is_compatible_version(&Version::parse("0.81.0").unwrap()));
         assert!(!is_compatible_version(&Version::parse("1.0.0").unwrap()));
+    }
+
+    #[test]
+    fn reads_the_standard_global_install_without_launching_pi() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("pi.cmd");
+        let package = directory
+            .path()
+            .join("node_modules/@earendil-works/pi-coding-agent/package.json");
+        fs::create_dir_all(package.parent().unwrap()).unwrap();
+        fs::write(&executable, "@echo off").unwrap();
+        fs::write(
+            package,
+            r#"{"name":"@earendil-works/pi-coding-agent","version":"0.80.10"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            installed_package_version(&executable),
+            Some(Version::parse("0.80.10").unwrap())
+        );
     }
 }

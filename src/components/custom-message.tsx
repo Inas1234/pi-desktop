@@ -1,6 +1,8 @@
-import { lazy, Suspense } from "react";
+import { lazy, Suspense, useMemo } from "react";
 
 import { StructuredData } from "@/components/structured-data";
+import { SubagentCard } from "@/components/subagent-card";
+import { subagentGroupFromCustom } from "@/lib/subagents";
 import type { CustomItem } from "@/lib/types";
 
 const MarkdownBody = lazy(() =>
@@ -8,6 +10,9 @@ const MarkdownBody = lazy(() =>
 );
 
 export function CustomMessage({ message }: { message: CustomItem }) {
+  const subagents = useMemo(() => subagentGroupFromCustom(message), [message]);
+  if (subagents) return <SubagentCard group={subagents} />;
+
   return (
     <article className="custom-message">
       <div className="message-label">[ext] {message.label}</div>

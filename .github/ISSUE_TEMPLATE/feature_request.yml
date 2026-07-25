@@ -1,0 +1,28 @@
+name: Feature request
+description: Propose a focused improvement to Pi Desktop.
+title: "[Feature]: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: Describe the user need rather than only a preferred implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Explain the workflow and how it fits Pi Desktop's chat-focused scope.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Include existing Pi or terminal workflows that may already address the need.
+  - type: textarea
+    id: impact
+    attributes:
+      label: Performance and architecture impact
+      description: Note expected effects on process ownership, memory, event frequency, or bundle size.

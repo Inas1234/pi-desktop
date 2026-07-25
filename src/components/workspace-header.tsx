@@ -17,11 +17,13 @@ export function WorkspaceHeader({ runtime }: WorkspaceHeaderProps) {
         <small>
           {runtime.connection === "starting"
             ? "Starting Pi"
-            : runtime.isStreaming
-              ? "Pi is working"
-              : runtime.connection === "connected"
-                ? "Ready"
-                : runtime.connection}
+            : runtime.sessionSwitchingTo
+              ? "Opening session"
+              : runtime.isStreaming
+                ? "Pi is working"
+                : runtime.connection === "connected"
+                  ? "Ready"
+                  : runtime.connection}
         </small>
       </div>
       <div className="workspace-header-actions">

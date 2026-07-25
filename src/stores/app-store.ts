@@ -13,7 +13,9 @@ import type {
   ProjectRecord,
   ProjectRuntime,
   ProviderCredentialStatus,
+  SessionPage,
   SessionSummary,
+  SessionTransition,
   ThinkingLevel,
   ToolItem,
   TranscriptItem,
@@ -45,6 +47,10 @@ export function createRuntime(): ProjectRuntime {
     historyCursor: null,
     hasOlder: false,
     historyLoading: false,
+    sessionSwitchingTo: null,
+    sessionTransitionPending: null,
+    sessionActivity: {},
+    backgroundExtensionRequests: {},
     isStreaming: false,
     isSettled: true,
     currentAssistantId: null,
@@ -55,6 +61,22 @@ export function createRuntime(): ProjectRuntime {
     widgets: {},
     extensionTitle: null,
     warning: null,
+  };
+}
+
+export function createCachedRuntime(
+  project: ProjectRecord,
+  commands: ProjectRuntime["commands"],
+  sessions?: SessionSummary[],
+): ProjectRuntime {
+  return {
+    ...createRuntime(),
+    commands,
+    sessions: (sessions ?? []).map((session) => ({
+      ...session,
+      isActive: session.path === project.activeSession,
+    })),
+    sessionsLoaded: sessions !== undefined,
   };
 }
 
@@ -272,6 +294,229 @@ export function normalizeMessages(messages: PiMessage[]): TranscriptItem[] {
     if (custom) result.push(custom);
   });
   return result;
+}
+
+export function hydrateRuntime(runtime: ProjectRuntime, page: SessionPage): ProjectRuntime {
+  return {
+    ...runtime,
+    messages: normalizeMessages(page.messages),
+    historyCursor: page.cursor,
+    hasOlder: page.hasOlder,
+    historyLoading: false,
+  };
+}
+
+function sameSessionPath(left: string | null | undefined, right: string | null | undefined) {
+  if (!left || !right) return left === right;
+  const normalize = (path: string) => {
+    const windowsPath = path.replaceAll("/", "\\");
+    const lowerPath = windowsPath.toLowerCase();
+    if (lowerPath.startsWith("\\\\?\\unc\\")) {
+      return `\\\\${lowerPath.slice(8)}`;
+    }
+    return lowerPath.startsWith("\\\\?\\") ? lowerPath.slice(4) : lowerPath;
+  };
+  return normalize(left) === normalize(right);
+}
+
+export function beginSessionSwitch(
+  source: AppStoreState,
+  projectId: string,
+  sessionPath: string,
+): AppStoreState {
+  const project = source.projects.find((item) => item.id === projectId);
+  if (!project) return source;
+  const runtime = source.runtimes[projectId] ?? createRuntime();
+  const session = runtime.sessions.find((item) => sameSessionPath(item.path, sessionPath));
+  const targetSessionId = session?.id;
+  const previousSessionId = runtime.state.sessionId;
+  let sessionActivity = runtime.sessionActivity;
+  let backgroundExtensionRequests = runtime.backgroundExtensionRequests;
+  if (previousSessionId && previousSessionId !== targetSessionId) {
+    if (runtime.isStreaming) {
+      sessionActivity = boundedRecord(sessionActivity, previousSessionId, "running", 32);
+    }
+    if (runtime.extensionRequests.length > 0) {
+      backgroundExtensionRequests = boundedRecord(
+        backgroundExtensionRequests,
+        previousSessionId,
+        runtime.extensionRequests,
+        16,
+      );
+    }
+  }
+  const targetActivity = targetSessionId ? sessionActivity[targetSessionId] : undefined;
+  const targetRequests = targetSessionId
+    ? (backgroundExtensionRequests[targetSessionId] ?? [])
+    : [];
+  if (targetSessionId) {
+    sessionActivity = boundedRecord(sessionActivity, targetSessionId, null, 32);
+    backgroundExtensionRequests = boundedRecord(
+      backgroundExtensionRequests,
+      targetSessionId,
+      null,
+      16,
+    );
+  }
+  const targetStreaming = targetActivity === "running" || targetActivity === "attention";
+  const nextRuntime = {
+    ...clearExtensionTransient({
+      ...runtime,
+      state: {
+        ...runtime.state,
+        sessionFile: sessionPath,
+        sessionId: targetSessionId,
+        sessionName: session?.name ?? session?.preview ?? undefined,
+        isStreaming: targetStreaming,
+        isCompacting: false,
+        pendingMessageCount: 0,
+      },
+      messages: [],
+      stats: {},
+      sessions: runtime.sessions.map((item) => ({
+        ...item,
+        isActive: sameSessionPath(item.path, sessionPath),
+      })),
+      historyCursor: null,
+      hasOlder: false,
+      historyLoading: false,
+      sessionSwitchingTo: sessionPath,
+      isStreaming: targetStreaming,
+      isSettled: !targetStreaming,
+      currentAssistantId: null,
+      warning: null,
+    }),
+    sessionActivity,
+    backgroundExtensionRequests,
+    extensionRequests: targetRequests,
+  };
+  return {
+    ...source,
+    activeProjectId: projectId,
+    projects: source.projects.map((item) =>
+      item.id === projectId ? { ...item, activeSession: sessionPath } : item,
+    ),
+    runtimes: { ...source.runtimes, [projectId]: nextRuntime },
+  };
+}
+
+export function beginSessionTransition(
+  source: AppStoreState,
+  projectId: string,
+  kind: SessionTransition["kind"],
+  sessionPath?: string,
+): AppStoreState {
+  const project = source.projects.find((item) => item.id === projectId);
+  if (!project) return source;
+  const runtime = source.runtimes[projectId] ?? createRuntime();
+  if (runtime.sessionTransitionPending || runtime.sessionSwitchingTo) return source;
+  const pending: SessionTransition = {
+    kind,
+    sessionPath,
+    fromSessionId: runtime.state.sessionId,
+    fromSessionFile: runtime.state.sessionFile ?? project.activeSession ?? undefined,
+  };
+  let sessionActivity = runtime.sessionActivity;
+  let backgroundExtensionRequests = runtime.backgroundExtensionRequests;
+  let extensionRequests = runtime.extensionRequests;
+  if (pending.fromSessionId) {
+    if (runtime.isStreaming) {
+      sessionActivity = boundedRecord(sessionActivity, pending.fromSessionId, "running", 32);
+    }
+    if (extensionRequests.length > 0) {
+      backgroundExtensionRequests = boundedRecord(
+        backgroundExtensionRequests,
+        pending.fromSessionId,
+        extensionRequests,
+        16,
+      );
+      extensionRequests = [];
+    }
+  }
+  return {
+    ...source,
+    activeProjectId: projectId,
+    projects: source.projects.map((project) =>
+      project.id === projectId && kind === "switch"
+        ? { ...project, activeSession: sessionPath ?? null }
+        : project,
+    ),
+    runtimes: {
+      ...source.runtimes,
+      [projectId]: {
+        ...runtime,
+        sessions:
+          kind === "switch"
+            ? runtime.sessions.map((session) => ({
+                ...session,
+                isActive: sameSessionPath(session.path, sessionPath),
+              }))
+            : runtime.sessions,
+        sessionTransitionPending: pending,
+        sessionActivity,
+        backgroundExtensionRequests,
+        extensionRequests,
+      },
+    },
+  };
+}
+
+function cancelSessionTransition(source: AppStoreState, projectId: string): AppStoreState {
+  const runtime = source.runtimes[projectId];
+  const pending = runtime?.sessionTransitionPending;
+  if (!runtime || !pending) return source;
+  return {
+    ...source,
+    projects: source.projects.map((project) =>
+      project.id === projectId
+        ? { ...project, activeSession: pending.fromSessionFile ?? null }
+        : project,
+    ),
+    runtimes: {
+      ...source.runtimes,
+      [projectId]: {
+        ...runtime,
+        sessions: runtime.sessions.map((session) => ({
+          ...session,
+          isActive: sameSessionPath(session.path, pending.fromSessionFile),
+        })),
+        sessionSwitchingTo: null,
+        sessionTransitionPending: null,
+      },
+    },
+  };
+}
+
+function snapshotMatchesSessionTransition(
+  runtime: ProjectRuntime,
+  state: ProjectRuntime["state"],
+): boolean {
+  const pending = runtime.sessionTransitionPending;
+  if (pending?.kind === "switch") {
+    return Boolean(
+      pending.sessionPath &&
+        state.sessionFile &&
+        sameSessionPath(pending.sessionPath, state.sessionFile),
+    );
+  }
+  if (pending?.kind === "new") {
+    if (pending.fromSessionId && state.sessionId === pending.fromSessionId) return false;
+    if (
+      pending.fromSessionFile &&
+      state.sessionFile &&
+      sameSessionPath(pending.fromSessionFile, state.sessionFile)
+    ) {
+      return false;
+    }
+  }
+  if (
+    runtime.sessionSwitchingTo &&
+    state.sessionFile &&
+    !sameSessionPath(runtime.sessionSwitchingTo, state.sessionFile)
+  ) {
+    return false;
+  }
+  return true;
 }
 
 function upsertTool(
@@ -628,6 +873,51 @@ function applyPiEvent(
   return runtime;
 }
 
+function reduceBackgroundSessionEvent(runtime: ProjectRuntime, event: AppEvent): ProjectRuntime {
+  const sessionId = event.sessionId;
+  if (!sessionId) return runtime;
+  let sessionActivity = runtime.sessionActivity;
+  let backgroundExtensionRequests = runtime.backgroundExtensionRequests;
+  const values =
+    event.type === "pi_event" ? [event.event] : event.type === "pi_events" ? event.events : [];
+
+  if (event.type === "snapshot") {
+    sessionActivity = boundedRecord(
+      sessionActivity,
+      sessionId,
+      event.state.isStreaming ? "running" : null,
+      32,
+    );
+  }
+  if (event.type === "process_exited") {
+    sessionActivity = boundedRecord(sessionActivity, sessionId, null, 32);
+    backgroundExtensionRequests = boundedRecord(backgroundExtensionRequests, sessionId, null, 16);
+  }
+  for (const value of values) {
+    const eventType = typeof value.type === "string" ? value.type : "unknown";
+    if (eventType === "agent_start") {
+      sessionActivity = boundedRecord(sessionActivity, sessionId, "running", 32);
+    } else if (eventType === "agent_settled") {
+      sessionActivity = boundedRecord(sessionActivity, sessionId, null, 32);
+    } else if (eventType === "extension_ui_request") {
+      const request = value as unknown as ExtensionUIRequest;
+      if (["select", "confirm", "input", "editor"].includes(request.method)) {
+        const requests = backgroundExtensionRequests[sessionId] ?? [];
+        if (!requests.some((entry) => entry.id === request.id)) {
+          backgroundExtensionRequests = boundedRecord(
+            backgroundExtensionRequests,
+            sessionId,
+            [...requests, request].slice(-16),
+            16,
+          );
+        }
+        sessionActivity = boundedRecord(sessionActivity, sessionId, "attention", 32);
+      }
+    }
+  }
+  return { ...runtime, sessionActivity, backgroundExtensionRequests };
+}
+
 export function reduceEvent(source: AppStoreState, event: AppEvent): AppStoreState {
   if (event.seq <= source.lastEventSeq) return source;
   let next = { ...source, lastEventSeq: event.seq };
@@ -636,6 +926,51 @@ export function reduceEvent(source: AppStoreState, event: AppEvent): AppStoreSta
       ...runtime,
       warning: `Event gap detected (${source.lastEventSeq + 1}–${event.seq - 1})`,
     }));
+  }
+  const currentRuntime = next.runtimes[event.projectId] ?? createRuntime();
+  const authoritativeTransitionSnapshot =
+    event.type === "snapshot" && snapshotMatchesSessionTransition(currentRuntime, event.state);
+  const pendingTransition = currentRuntime.sessionTransitionPending;
+  const pendingTargetSessionId =
+    pendingTransition?.kind === "switch"
+      ? currentRuntime.sessions.find((session) =>
+          sameSessionPath(session.path, pendingTransition.sessionPath),
+        )?.id
+      : undefined;
+  const targetsBackgroundSession = Boolean(
+    !authoritativeTransitionSnapshot &&
+      event.sessionId &&
+      (pendingTransition?.kind === "new"
+        ? event.sessionId === pendingTransition.fromSessionId || event.type === "process_exited"
+        : pendingTransition?.kind === "switch"
+          ? pendingTargetSessionId
+            ? event.sessionId !== pendingTargetSessionId
+            : event.sessionId === pendingTransition.fromSessionId
+          : currentRuntime.state.sessionId && event.sessionId !== currentRuntime.state.sessionId),
+  );
+  if (targetsBackgroundSession) {
+    return updateRuntime(next, event.projectId, (runtime) =>
+      reduceBackgroundSessionEvent(runtime, event),
+    );
+  }
+  if (
+    event.type === "snapshot" &&
+    snapshotMatchesSessionTransition(next.runtimes[event.projectId] ?? createRuntime(), event.state)
+  ) {
+    next = {
+      ...next,
+      projects: next.projects.map((project) =>
+        project.id === event.projectId
+          ? { ...project, activeSession: event.state.sessionFile ?? null }
+          : project,
+      ),
+    };
+  }
+  if (event.type === "process_exited") {
+    next = cancelSessionTransition(next, event.projectId);
+  }
+  if (event.type === "connection" && event.state === "error") {
+    next = cancelSessionTransition(next, event.projectId);
   }
   return updateRuntime(next, event.projectId, (runtime) => {
     if (event.type === "connection") {
@@ -653,6 +988,19 @@ export function reduceEvent(source: AppStoreState, event: AppEvent): AppStoreSta
         : updated;
     }
     if (event.type === "snapshot") {
+      if (!snapshotMatchesSessionTransition(runtime, event.state)) return runtime;
+      const activeSessionId = event.state.sessionId;
+      let sessionActivity = runtime.sessionActivity;
+      let backgroundExtensionRequests = runtime.backgroundExtensionRequests;
+      if (activeSessionId) {
+        sessionActivity = boundedRecord(sessionActivity, activeSessionId, null, 32);
+        backgroundExtensionRequests = boundedRecord(
+          backgroundExtensionRequests,
+          activeSessionId,
+          null,
+          16,
+        );
+      }
       return {
         ...runtime,
         connection: "connected",
@@ -664,6 +1012,14 @@ export function reduceEvent(source: AppStoreState, event: AppEvent): AppStoreSta
         historyCursor: event.historyCursor ?? null,
         hasOlder: Boolean(event.hasOlder),
         historyLoading: false,
+        sessionSwitchingTo: null,
+        sessionTransitionPending: null,
+        sessionActivity,
+        backgroundExtensionRequests,
+        sessions: runtime.sessions.map((session) => ({
+          ...session,
+          isActive: sameSessionPath(session.path, event.state.sessionFile),
+        })),
         isStreaming: Boolean(event.state.isStreaming),
         isSettled: !event.state.isStreaming,
         warning: null,
@@ -688,6 +1044,7 @@ export function reduceEvent(source: AppStoreState, event: AppEvent): AppStoreSta
           : `Pi exited${event.code == null ? "" : ` with code ${event.code}`}`,
         isStreaming: false,
         isSettled: true,
+        sessionTransitionPending: null,
       });
     }
     if (event.type === "extension_ui_expired") {
@@ -794,6 +1151,26 @@ async function refreshSessions(projectId: string, query = "") {
   }
 }
 
+async function hydrateActiveSession(projectId: string) {
+  const project = state.projects.find((item) => item.id === projectId);
+  const sessionPath = project?.activeSession;
+  if (!sessionPath) return;
+  try {
+    const page = await desktop.loadSessionPage(projectId, null, 200);
+    const activeSession = state.projects.find((item) => item.id === projectId)?.activeSession;
+    if (activeSession !== sessionPath) return;
+    publish(
+      updateRuntime(state, projectId, (runtime) => {
+        if (runtime.state.sessionId || runtime.messages.length > 0) return runtime;
+        if (runtime.state.sessionFile && runtime.state.sessionFile !== sessionPath) return runtime;
+        return hydrateRuntime(runtime, page);
+      }),
+    );
+  } catch {
+    // Pi's bootstrap snapshot remains the authoritative fallback.
+  }
+}
+
 export const appStore = {
   getSnapshot: () => state,
   subscribe(listener: () => void) {
@@ -810,7 +1187,17 @@ export const appStore = {
         return;
       }
       const runtimes = Object.fromEntries(
-        bootstrap.projects.map((project) => [project.id, createRuntime()]),
+        bootstrap.projects.map((project) => {
+          const cachedSessions = bootstrap.cachedSessionSummaries[project.id];
+          return [
+            project.id,
+            createCachedRuntime(
+              project,
+              bootstrap.cachedCommandCatalogs[project.id] ?? [],
+              cachedSessions,
+            ),
+          ];
+        }),
       );
       const activeProjectId =
         bootstrap.settings.activeProjectId ?? bootstrap.projects[0]?.id ?? null;
@@ -863,24 +1250,81 @@ export const appStore = {
     const project = state.projects.find((item) => item.id === projectId);
     if (!project) return;
     patch({ activeProjectId: projectId });
+    void hydrateActiveSession(projectId);
     void refreshSessions(projectId);
     await withError(() => desktop.activateProject(projectId));
   },
   refreshSessions,
   async newSession(projectId: string) {
-    await withError(() => desktop.newSession(projectId));
+    const runtime = state.runtimes[projectId];
+    if (runtime?.sessionTransitionPending || runtime?.sessionSwitchingTo) return;
+    publish(beginSessionTransition(state, projectId, "new"));
+    const completed = await withError(async () => {
+      await desktop.newSession(projectId);
+      return true;
+    });
+    if (!completed) {
+      publish(cancelSessionTransition(state, projectId));
+      return;
+    }
     await refreshSessions(projectId);
   },
   async openSession(projectId: string, sessionPath: string) {
-    await withError(() => desktop.openSession(projectId, sessionPath));
-    await refreshSessions(projectId);
+    const project = state.projects.find((item) => item.id === projectId);
+    const runtime = state.runtimes[projectId];
+    if (
+      !project ||
+      (state.activeProjectId === projectId &&
+        sameSessionPath(project.activeSession, sessionPath) &&
+        !runtime?.sessionSwitchingTo)
+    ) {
+      return;
+    }
+
+    if (runtime?.sessionTransitionPending || runtime?.sessionSwitchingTo) return;
+    const transition = beginSessionTransition(state, projectId, "switch", sessionPath);
+    const openImmediately = !runtime || (runtime.isSettled && !runtime.isStreaming);
+    const hydrateSelectedSession = () => {
+      void desktop
+        .loadSessionPage(projectId, null, 200, sessionPath)
+        .then((page) => {
+          const current = state.runtimes[projectId];
+          if (!sameSessionPath(current?.sessionSwitchingTo, sessionPath)) return;
+          publish(updateRuntime(state, projectId, (value) => hydrateRuntime(value, page)));
+        })
+        .catch(() => {
+          // Pi's authoritative switch snapshot remains the fallback.
+        });
+    };
+    publish(openImmediately ? beginSessionSwitch(transition, projectId, sessionPath) : transition);
+    if (openImmediately) {
+      hydrateSelectedSession();
+    }
+    const completed = await withError(async () => {
+      await desktop.openSession(projectId, sessionPath);
+      return true;
+    });
+    if (!completed) {
+      publish(cancelSessionTransition(state, projectId));
+      return;
+    }
+    if (!openImmediately && state.runtimes[projectId]?.sessionTransitionPending) {
+      publish(beginSessionSwitch(state, projectId, sessionPath));
+      hydrateSelectedSession();
+    }
+    void refreshSessions(projectId);
   },
   async loadOlder(projectId: string) {
     const runtime = state.runtimes[projectId];
     if (!runtime?.hasOlder || runtime.historyLoading) return;
     publish(updateRuntime(state, projectId, (current) => ({ ...current, historyLoading: true })));
     const page = await withError(() =>
-      desktop.loadSessionPage(projectId, runtime.historyCursor, 100),
+      desktop.loadSessionPage(
+        projectId,
+        runtime.historyCursor,
+        100,
+        state.projects.find((project) => project.id === projectId)?.activeSession ?? undefined,
+      ),
     );
     if (!page) {
       publish(
@@ -942,6 +1386,7 @@ export const appStore = {
   },
   setSettingsOpen(open: boolean) {
     patch({ settingsOpen: open });
+    if (open) void this.refreshProviders();
   },
   setCommandPaletteOpen(open: boolean) {
     patch({ commandPaletteOpen: open });
